@@ -85,6 +85,35 @@ class ManagedHostParsingTest(unittest.TestCase):
                     {"beta"},
                 )
 
+    def test_host_normalization_boundaries(self) -> None:
+        for value, expected in (
+            ("user@host", "host"),
+            ("[2001:db8::1]:2222", "2001:db8::1"),
+            ("[beta", "[beta"),
+            ("[host]suffix]", "host"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("host:2222", "host"),
+            ("example.x", "example.x"),
+            ("EXAMPLE.X", "example.x"),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(shadow_wrapper.normalize_host(value), expected)
+
+    def test_ssh_option_values_are_not_hosts(self) -> None:
+        for args in (
+            ["-p", "22", "beta"],
+            ["-p22", "beta"],
+            ["-o", "ProxyCommand=none", "beta"],
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    shadow_wrapper.find_target_hosts(args, "ssh"), {"beta"}
+                )
+
+    def test_ssh_option_terminator_is_respected(self) -> None:
+        self.assertEqual(shadow_wrapper.extract_ssh_host(["--", "-V"]), "-v")
+        self.assertFalse(shadow_wrapper.is_non_connecting_ssh_invocation(["--", "-V"]))
+
     def test_non_connecting_ssh_modes_do_not_probe(self) -> None:
         for option, args in (
             ("-G", ["-G", "beta"]),
@@ -93,6 +122,14 @@ class ManagedHostParsingTest(unittest.TestCase):
         ):
             with self.subTest(option=option):
                 self.assertEqual(shadow_wrapper.find_target_hosts(args, "ssh"), set())
+
+    def test_non_connecting_ssh_modes_follow_other_options(self) -> None:
+        for args in (
+            ["-p", "22", "-V"],
+            ["-x", "-V"],
+        ):
+            with self.subTest(args=args):
+                self.assertTrue(shadow_wrapper.is_non_connecting_ssh_invocation(args))
 
     def test_remote_command_options_do_not_bypass_ssh_guard(self) -> None:
         for args in (
@@ -114,6 +151,25 @@ class ManagedHostParsingTest(unittest.TestCase):
                     shadow_wrapper.find_target_hosts(["source", destination], "scp"),
                     {"beta"},
                 )
+
+    def test_scp_remote_source_and_option_values_are_distinguished(self) -> None:
+        self.assertEqual(
+            shadow_wrapper.find_target_hosts(["beta:source", "destination"], "scp"),
+            {"beta"},
+        )
+        self.assertEqual(
+            shadow_wrapper.find_target_hosts(
+                ["-o", "beta:path", "source", "destination"], "scp"
+            ),
+            set(),
+        )
+        self.assertEqual(
+            shadow_wrapper.find_target_hosts(
+                ["-o", "ProxyCommand=none", "source", "beta:destination"],
+                "scp",
+            ),
+            {"beta"},
+        )
 
     def test_unmanaged_hosts_are_not_guarded(self) -> None:
         for command, args in (
@@ -137,8 +193,57 @@ class ManagedHostParsingTest(unittest.TestCase):
         args = ["--exclude", "cache", "source/", "user@BETA.:destination/"]
         self.assertEqual(shadow_wrapper.find_target_hosts(args, "rsync"), {"beta"})
 
+    def test_rsync_daemon_endpoint_is_guarded(self) -> None:
+        self.assertEqual(
+            shadow_wrapper.find_target_hosts(["source/", "BETA::module"], "rsync"),
+            {"beta"},
+        )
+
+    def test_rsync_flag_does_not_consume_endpoint(self) -> None:
+        for args in (
+            ["--archive", "source/", "beta:destination/"],
+            ["--archive", "beta:destination/"],
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(
+                    shadow_wrapper.find_target_hosts(args, "rsync"), {"beta"}
+                )
+
+    def test_rsync_option_terminator_preserves_option_like_operands(self) -> None:
+        self.assertEqual(
+            list(
+                shadow_wrapper.iterate_non_option_args_rsync(
+                    ["--", "--exclude", "beta:destination/"]
+                )
+            ),
+            ["--exclude", "beta:destination/"],
+        )
+
 
 class StateRecoveryTest(unittest.TestCase):
+    def test_valid_state_is_restored(self) -> None:
+        document = {
+            "beta": {
+                "declined": True,
+                "last_checked": "2026-08-13T19:00:00+00:00",
+                "was_accessible": False,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text(json.dumps(document))
+            with mock.patch.object(shadow_wrapper, "STATE_FILE", state_file):
+                self.assertEqual(
+                    shadow_wrapper.load_state(),
+                    {
+                        "beta": shadow_wrapper.HostState(
+                            declined=True,
+                            last_checked="2026-08-13T19:00:00+00:00",
+                            was_accessible=False,
+                        )
+                    },
+                )
+
     def test_structurally_invalid_json_is_treated_as_empty_state(self) -> None:
         invalid_documents = (
             [],
@@ -150,6 +255,20 @@ class StateRecoveryTest(unittest.TestCase):
                     "declined": "false",
                     "last_checked": "today",
                     "was_accessible": False,
+                }
+            },
+            {
+                "beta": {
+                    "declined": False,
+                    "last_checked": 0,
+                    "was_accessible": False,
+                }
+            },
+            {
+                "beta": {
+                    "declined": False,
+                    "last_checked": "today",
+                    "was_accessible": 0,
                 }
             },
         )

@@ -225,9 +225,6 @@ def extract_ssh_host(args: list[str]) -> str | None:
             # Check if this option consumes the next argument
             if arg in SSH_OPTIONS_WITH_VALUES:
                 skip_next = True
-            # Handle combined option-value like -oOption=value or -p22
-            elif len(arg) > 2 and arg[:2] in SSH_OPTIONS_WITH_VALUES:
-                pass  # Value is part of this arg
             continue
 
         # First positional argument is the host
