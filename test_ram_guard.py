@@ -160,7 +160,18 @@ class RamGuardIntegrationTest(unittest.TestCase):
             ram_guard.process_rows()
         except ram_guard.ProcessInspectionError:
             self.skipTest("process-table inspection is unavailable in this sandbox")
-        code = "import time; value=bytearray(80*1024*1024); time.sleep(3)"
+        # bytearray() hands back lazily-mapped zero pages, so an untouched
+        # allocation leaves the child resident in about 9 MiB and the guard
+        # rightly finds nothing above the ceiling. Write a byte per page so the
+        # allocation is genuinely resident, the way a runaway job's would be.
+        # The child then outlives many poll intervals, since the guard samples
+        # by spawning `ps` and a loaded host needs room to take a sample.
+        code = (
+            "import time;"
+            "value = bytearray(80 * 1024 * 1024);"
+            "value[::4096] = b'x' * len(value[::4096]);"
+            "time.sleep(30)"
+        )
         result = subprocess.run(
             [
                 str(GUARD),
