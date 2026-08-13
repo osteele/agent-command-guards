@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""Run a command while enforcing a process-tree resident-memory ceiling."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_AVAILABLE_FRACTION = 0.70
+MINIMUM_DYNAMIC_LIMIT = 256 * 1024**2
+DEFAULT_POLL_SECONDS = 0.25
+DEFAULT_TERM_GRACE_SECONDS = 2.0
+DEFAULT_MPS_HIGH_WATERMARK_RATIO = "0.7"
+DEFAULT_MPS_LOW_WATERMARK_RATIO = "0.6"
+
+
+class ProcessInspectionError(RuntimeError):
+    """Raised when the process table cannot be inspected reliably."""
+
+
+class MemoryAvailabilityError(RuntimeError):
+    """Raised when the host's available memory cannot be determined."""
+
+
+@dataclass(frozen=True)
+class ProcessRow:
+    pid: int
+    ppid: int
+    pgid: int
+    rss_bytes: int
+
+
+def parse_size(value: str) -> int:
+    """Parse a positive byte size with an optional binary K/M/G/T suffix."""
+    normalized = value.strip().upper()
+    multipliers = {
+        "": 1,
+        "B": 1,
+        "K": 1024,
+        "KB": 1024,
+        "KIB": 1024,
+        "M": 1024**2,
+        "MB": 1024**2,
+        "MIB": 1024**2,
+        "G": 1024**3,
+        "GB": 1024**3,
+        "GIB": 1024**3,
+        "T": 1024**4,
+        "TB": 1024**4,
+        "TIB": 1024**4,
+    }
+    number = normalized
+    suffix = ""
+    for candidate in sorted(multipliers, key=len, reverse=True):
+        if candidate and normalized.endswith(candidate):
+            number = normalized[: -len(candidate)]
+            suffix = candidate
+            break
+    try:
+        result = int(float(number) * multipliers[suffix])
+    except (KeyError, OverflowError, ValueError) as error:
+        raise argparse.ArgumentTypeError(f"invalid memory size: {value}") from error
+    if result <= 0:
+        raise argparse.ArgumentTypeError("memory size must be positive")
+    return result
+
+
+def format_size(value: int) -> str:
+    """Format bytes for a concise diagnostic."""
+    for suffix, divisor in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
+        if value >= divisor:
+            return f"{value / divisor:.2f} {suffix}"
+    return f"{value} B"
+
+
+def parse_memory_pressure_output(output: str) -> int:
+    """Extract macOS's available-memory estimate from `memory_pressure -Q`."""
+    total_match = re.search(r"system has (\d+)", output, re.IGNORECASE)
+    free_match = re.search(
+        r"memory free percentage:\s*([0-9]+(?:\.[0-9]+)?)%",
+        output,
+        re.IGNORECASE,
+    )
+    if total_match is None or free_match is None:
+        raise MemoryAvailabilityError("could not parse memory_pressure output")
+    total_bytes = int(total_match.group(1))
+    free_fraction = float(free_match.group(1)) / 100
+    available_bytes = int(total_bytes * free_fraction)
+    if total_bytes <= 0 or available_bytes <= 0:
+        raise MemoryAvailabilityError("memory_pressure reported no available memory")
+    return available_bytes
+
+
+def parse_meminfo(output: str) -> int:
+    """Extract Linux MemAvailable from /proc/meminfo."""
+    match = re.search(r"^MemAvailable:\s*(\d+)\s+kB$", output, re.MULTILINE)
+    if match is None:
+        raise MemoryAvailabilityError("could not find MemAvailable in /proc/meminfo")
+    available_bytes = int(match.group(1)) * 1024
+    if available_bytes <= 0:
+        raise MemoryAvailabilityError("/proc/meminfo reported no available memory")
+    return available_bytes
+
+
+def available_memory_bytes() -> int:
+    """Return memory available for a new workload at this instant."""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["/usr/bin/memory_pressure", "-Q"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise MemoryAvailabilityError(
+                f"could not run memory_pressure: {error}"
+            ) from error
+        if result.returncode != 0:
+            message = result.stderr.strip() or f"exit status {result.returncode}"
+            raise MemoryAvailabilityError(f"memory_pressure failed: {message}")
+        return parse_memory_pressure_output(result.stdout)
+
+    if sys.platform.startswith("linux"):
+        try:
+            return parse_meminfo(Path("/proc/meminfo").read_text())
+        except OSError as error:
+            raise MemoryAvailabilityError(
+                f"could not read /proc/meminfo: {error}"
+            ) from error
+
+    raise MemoryAvailabilityError(f"unsupported platform: {sys.platform}")
+
+
+def parse_available_fraction(value: str) -> float:
+    """Parse the fraction of currently available memory that a job may use."""
+    try:
+        fraction = float(value)
+    except ValueError as error:
+        raise MemoryAvailabilityError(
+            f"invalid LLM_RAM_GUARD_AVAILABLE_FRACTION: {value}"
+        ) from error
+    if not 0 < fraction < 1:
+        raise MemoryAvailabilityError(
+            "LLM_RAM_GUARD_AVAILABLE_FRACTION must be greater than 0 and less than 1"
+        )
+    return fraction
+
+
+def resolve_memory_limit(explicit_limit: int | None) -> tuple[int, str, int | None]:
+    """Resolve an explicit ceiling or compute one from memory available now."""
+    if explicit_limit is not None:
+        try:
+            available_bytes = available_memory_bytes()
+        except MemoryAvailabilityError:
+            available_bytes = None
+        return explicit_limit, "explicit", available_bytes
+
+    environment_limit = os.environ.get("LLM_RAM_GUARD_LIMIT")
+    if environment_limit:
+        try:
+            limit_bytes = parse_size(environment_limit)
+        except argparse.ArgumentTypeError as error:
+            raise MemoryAvailabilityError(str(error)) from error
+        try:
+            available_bytes = available_memory_bytes()
+        except MemoryAvailabilityError:
+            available_bytes = None
+        return limit_bytes, "LLM_RAM_GUARD_LIMIT", available_bytes
+
+    fraction = parse_available_fraction(
+        os.environ.get(
+            "LLM_RAM_GUARD_AVAILABLE_FRACTION", str(DEFAULT_AVAILABLE_FRACTION)
+        )
+    )
+    available_bytes = available_memory_bytes()
+    limit_bytes = int(available_bytes * fraction)
+    if limit_bytes < MINIMUM_DYNAMIC_LIMIT:
+        raise MemoryAvailabilityError(
+            f"only {format_size(available_bytes)} is available; refusing to start with "
+            f"a computed ceiling below {format_size(MINIMUM_DYNAMIC_LIMIT)}"
+        )
+    description = (
+        f"{fraction:.0%} of {format_size(available_bytes)} available at launch"
+    )
+    return limit_bytes, description, available_bytes
+
+
+def process_rows() -> tuple[ProcessRow, ...]:
+    """Read the local process table using the macOS/Linux ps interface."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,rss="],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProcessInspectionError(f"could not run ps: {error}") from error
+    if result.returncode != 0:
+        message = result.stderr.strip() or f"ps exited {result.returncode}"
+        raise ProcessInspectionError(message)
+
+    rows: list[ProcessRow] = []
+    try:
+        for line in result.stdout.splitlines():
+            pid, ppid, pgid, rss_kib = (int(part) for part in line.split())
+            rows.append(ProcessRow(pid, ppid, pgid, rss_kib * 1024))
+    except ValueError as error:
+        raise ProcessInspectionError("could not parse ps output") from error
+    return tuple(rows)
+
+
+def guarded_processes(
+    rows: tuple[ProcessRow, ...], root_pid: int, process_group: int
+) -> tuple[ProcessRow, ...]:
+    """Return the root process, its descendants, and members of its process group."""
+    selected = {row.pid for row in rows if row.pgid == process_group}
+    selected.add(root_pid)
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            if row.pid not in selected and row.ppid in selected:
+                selected.add(row.pid)
+                changed = True
+    return tuple(row for row in rows if row.pid in selected)
+
+
+def terminate_process_group(process_group: int, grace_seconds: float) -> None:
+    """Terminate only the process group created by this guard."""
+    if process_group <= 1:
+        raise RuntimeError(
+            f"refusing to terminate invalid process group {process_group}"
+        )
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # Some command sandboxes allow signalling an owned group but hide
+            # process-existence probes. The initial SIGTERM has still been sent.
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process_group, signal.SIGKILL)
+
+
+def terminate_child(
+    child: subprocess.Popen[bytes],
+    process_group: int,
+    grace_seconds: float,
+    exit_code: int,
+) -> int:
+    """Terminate the guarded group, reap its leader, and return an exit code."""
+    terminate_process_group(process_group, grace_seconds)
+    child.wait()
+    return exit_code
+
+
+def child_environment() -> dict[str, str]:
+    """Build the guarded environment, preserving explicit PyTorch settings."""
+    environment = dict(os.environ)
+    environment["LLM_RAM_GUARD_ACTIVE"] = "1"
+    environment.setdefault(
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+        environment.get(
+            "LLM_MPS_HIGH_WATERMARK_RATIO", DEFAULT_MPS_HIGH_WATERMARK_RATIO
+        ),
+    )
+    environment.setdefault(
+        "PYTORCH_MPS_LOW_WATERMARK_RATIO",
+        environment.get("LLM_MPS_LOW_WATERMARK_RATIO", DEFAULT_MPS_LOW_WATERMARK_RATIO),
+    )
+    return environment
+
+
+def normalize_returncode(returncode: int) -> int:
+    """Translate subprocess signal return codes to conventional shell codes."""
+    return 128 + (-returncode) if returncode < 0 else returncode
+
+
+def run_guarded(
+    command: list[str],
+    *,
+    limit_bytes: int,
+    available_at_launch: int | None,
+    poll_seconds: float,
+    term_grace_seconds: float,
+) -> int:
+    """Run and monitor a command until all owned processes exit."""
+    child = subprocess.Popen(
+        command,
+        env=child_environment(),
+        start_new_session=True,
+    )
+    process_group = child.pid
+    forwarded_signal: int | None = None
+    process_inspection_available = True
+    availability_floor = (
+        max(available_at_launch - limit_bytes, 0)
+        if available_at_launch is not None
+        else None
+    )
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal forwarded_signal
+        forwarded_signal = signum
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process_group, signum)
+
+    previous_handlers = {
+        signum: signal.signal(signum, forward_signal)
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        while True:
+            owned: tuple[ProcessRow, ...] = ()
+            if process_inspection_available:
+                try:
+                    rows = process_rows()
+                except ProcessInspectionError as error:
+                    process_inspection_available = False
+                    print(
+                        "ram-guard: process inspection unavailable "
+                        f"({error}); enforcing the available-memory floor",
+                        file=sys.stderr,
+                    )
+                else:
+                    owned = guarded_processes(rows, child.pid, process_group)
+                    rss_bytes = sum(row.rss_bytes for row in owned)
+                    if rss_bytes >= limit_bytes:
+                        print(
+                            "ram-guard: resident-memory limit exceeded: "
+                            f"{format_size(rss_bytes)} >= {format_size(limit_bytes)}; "
+                            f"terminating process group {process_group}",
+                            file=sys.stderr,
+                        )
+                        return terminate_child(
+                            child, process_group, term_grace_seconds, 137
+                        )
+
+            if not process_inspection_available and availability_floor is not None:
+                try:
+                    current_available = available_memory_bytes()
+                except MemoryAvailabilityError as error:
+                    if not process_inspection_available:
+                        print(
+                            "ram-guard: both memory monitors are unavailable: "
+                            f"{error}; terminating process group {process_group}",
+                            file=sys.stderr,
+                        )
+                        return terminate_child(
+                            child, process_group, term_grace_seconds, 70
+                        )
+                else:
+                    if current_available <= availability_floor:
+                        print(
+                            "ram-guard: available-memory reserve reached: "
+                            f"{format_size(current_available)} <= "
+                            f"{format_size(availability_floor)}; terminating process "
+                            f"group {process_group}",
+                            file=sys.stderr,
+                        )
+                        return terminate_child(
+                            child, process_group, term_grace_seconds, 137
+                        )
+
+            if not process_inspection_available and availability_floor is None:
+                print(
+                    "ram-guard: no usable memory monitor; terminating process group "
+                    f"{process_group}",
+                    file=sys.stderr,
+                )
+                return terminate_child(child, process_group, term_grace_seconds, 70)
+
+            returncode = child.poll()
+            remaining = tuple(row for row in owned if row.pid != child.pid)
+            if returncode is not None and not remaining:
+                if forwarded_signal is not None:
+                    return 128 + forwarded_signal
+                return normalize_returncode(returncode)
+            time.sleep(poll_seconds)
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a command with a process-tree resident-memory ceiling."
+    )
+    parser.add_argument(
+        "--limit",
+        default=None,
+        type=parse_size,
+        help=(
+            "resident-memory ceiling; defaults to 70%% of memory available at launch "
+            "or LLM_RAM_GUARD_LIMIT"
+        ),
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        default=DEFAULT_POLL_SECONDS,
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--term-grace-seconds",
+        default=DEFAULT_TERM_GRACE_SECONDS,
+        type=float,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("a command is required after --")
+    if args.poll_seconds <= 0 or args.term_grace_seconds < 0:
+        parser.error("poll and grace intervals must be positive")
+    return args
+
+
+def main() -> int:
+    args = parse_args(sys.argv[1:])
+    try:
+        limit_bytes, limit_source, available_at_launch = resolve_memory_limit(
+            args.limit
+        )
+    except MemoryAvailabilityError as error:
+        print(
+            "ram-guard: cannot determine a safe memory ceiling: "
+            f"{error}; set LLM_RAM_GUARD_LIMIT to override",
+            file=sys.stderr,
+        )
+        return 70
+    if os.environ.get("LLM_RAM_GUARD_QUIET", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(
+            f"ram-guard: ceiling {format_size(limit_bytes)} ({limit_source})",
+            file=sys.stderr,
+        )
+    return run_guarded(
+        args.command,
+        limit_bytes=limit_bytes,
+        available_at_launch=available_at_launch,
+        poll_seconds=args.poll_seconds,
+        term_grace_seconds=args.term_grace_seconds,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Shadow uv so local `uv run` commands inherit the agent RAM guard."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+GUARD = HERE / "ram-guard"
+BYPASS_VALUES = {"0", "false", "no", "off"}
+GLOBAL_OPTIONS_WITH_VALUES = {
+    "--allow-insecure-host",
+    "--cache-dir",
+    "--color",
+    "--config-file",
+    "--directory",
+    "--project",
+    "--python-preference",
+}
+
+
+def find_real_uv() -> str:
+    """Find the next executable uv on PATH, excluding this wrapper."""
+    wrapper = Path(__file__).resolve()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory).expanduser() / "uv"
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved == wrapper or not os.access(resolved, os.X_OK):
+            continue
+        # A mise shim may recurse or wait indefinitely when this shadow is ahead
+        # of it on PATH. Continue to the concrete uv binary instead.
+        if resolved.name == "mise":
+            continue
+        return str(candidate)
+    raise RuntimeError("could not find the real uv binary after the shadow wrapper")
+
+
+def guard_disabled() -> bool:
+    value = os.environ.get("LLM_RAM_GUARD", "").strip().lower()
+    return value in BYPASS_VALUES
+
+
+def find_subcommand(args: list[str]) -> str | None:
+    """Return uv's subcommand after any global options."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in GLOBAL_OPTIONS_WITH_VALUES:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+
+def main() -> None:
+    real_uv = find_real_uv()
+    args = sys.argv[1:]
+    should_guard = (
+        find_subcommand(args) == "run"
+        and not guard_disabled()
+        and os.environ.get("LLM_RAM_GUARD_ACTIVE") != "1"
+    )
+    if should_guard:
+        os.execv(str(GUARD), [str(GUARD), "--", real_uv, *args])
+    os.execv(real_uv, [real_uv, *args])
+
+
+if __name__ == "__main__":
+    main()

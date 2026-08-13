@@ -1,0 +1,388 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_PATH="$(realpath "$0")"
+
+find_real_binary() {
+    local binary="$1"
+    shift
+    local skip_paths=("$@")
+    local candidate real_candidate skip
+    while IFS= read -r candidate; do
+        real_candidate="$(realpath "$candidate" 2>/dev/null || true)"
+        if [[ -z "$real_candidate" ]]; then
+            continue
+        fi
+        skip=false
+        for skip_path in "${skip_paths[@]}"; do
+            if [[ -n "$skip_path" && "$real_candidate" == "$skip_path" ]]; then
+                skip=true
+                break
+            fi
+        done
+        if [[ "$skip" == false ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done < <(which -a "$binary" 2>/dev/null)
+
+    echo "Error: Could not find real $binary binary" >&2
+    exit 1
+}
+
+REAL_GIT="$(find_real_binary git "$SCRIPT_PATH")"
+
+GIT_SEARCH_DIR="$PWD"
+SUBCMD=""
+SUBCMD_INDEX=0
+EXPLICIT_GIT_REPOSITORY=false
+if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
+    EXPLICIT_GIT_REPOSITORY=true
+fi
+
+update_git_search_dir() {
+    local requested="$1"
+    if [[ "$requested" == /* ]]; then
+        GIT_SEARCH_DIR="$requested"
+    else
+        GIT_SEARCH_DIR="$GIT_SEARCH_DIR/$requested"
+    fi
+    if [[ -d "$GIT_SEARCH_DIR" ]]; then
+        GIT_SEARCH_DIR="$(cd -- "$GIT_SEARCH_DIR" && pwd -P)"
+    fi
+}
+
+parse_git_invocation() {
+    local -a arguments=("$@")
+    local index=0 arg
+    while (( index < ${#arguments[@]} )); do
+        arg="${arguments[$index]}"
+        case "$arg" in
+            -C)
+                index=$((index + 1))
+                if (( index >= ${#arguments[@]} )); then return; fi
+                update_git_search_dir "${arguments[$index]}"
+                ;;
+            -C?*) update_git_search_dir "${arg:2}" ;;
+            -c|--config-env|--namespace)
+                index=$((index + 1))
+                ;;
+            --git-dir|--work-tree)
+                EXPLICIT_GIT_REPOSITORY=true
+                index=$((index + 1))
+                ;;
+            --git-dir=*|--work-tree=*|--bare) EXPLICIT_GIT_REPOSITORY=true ;;
+            -c?*|--config-env=*|--namespace=*) ;;
+            -*) ;;
+            *)
+                SUBCMD="$arg"
+                SUBCMD_INDEX=$((index + 1))
+                return
+                ;;
+        esac
+        index=$((index + 1))
+    done
+}
+
+parse_git_invocation "$@"
+if (( SUBCMD_INDEX > 0 )); then
+    SUBCMD_ARGS=("${@:$((SUBCMD_INDEX + 1))}")
+else
+    SUBCMD_ARGS=()
+fi
+
+# Walk up from Git's effective working directory looking for a .jj directory.
+find_jj_root() {
+    if $EXPLICIT_GIT_REPOSITORY; then return 1; fi
+    local dir="${1:-$PWD}"
+    dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || return 1
+    while true; do
+        if [[ -d "$dir/.jj" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        if [[ "$dir" == "/" ]]; then
+            break
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Return the path to the backing git dir for a jj repo root
+get_jj_git_dir() {
+    local jj_root="$1"
+    if [[ -e "$jj_root/.git" ]]; then
+        # Co-located repo: jj mirrors state into the .git directory
+        echo "$jj_root/.git"
+        return 0
+    fi
+    local backing="$jj_root/.jj/repo/store/git"
+    if [[ -d "$backing" ]]; then
+        echo "$backing"
+        return 0
+    fi
+    return 1
+}
+
+# Export jj to its backing git repo; if it fails due to undescribed revisions,
+# auto-describe them and retry.
+jj_export_with_retry() {
+    local jj_root="$1"
+    if jj -R "$jj_root" git export 2>/dev/null; then
+        return 0
+    fi
+    echo "git shadow: jj export failed, running jj-ai-describe --all ..." >&2
+    (cd -- "$jj_root" && jj-ai-describe --all 2>/dev/null) || return 1
+    jj -R "$jj_root" git export 2>/dev/null || return 1
+}
+
+# Point git HEAD at the jj working copy parent (@-) so that git commands
+# like "git diff HEAD" work against the backing store.
+# Mirrors the jj alias git-symlink-head from ~/.jjconfig.toml.
+sync_git_head() {
+    local git_dir="$1"
+    local jj_root="$2"
+    local commit_id
+    commit_id="$(jj -R "$jj_root" log -r @- --no-graph -T commit_id 2>/dev/null)" || return 1
+    "$REAL_GIT" --git-dir="$git_dir" update-ref refs/heads/jj-head "$commit_id" 2>/dev/null || return 1
+    "$REAL_GIT" --git-dir="$git_dir" symbolic-ref HEAD refs/heads/jj-head 2>/dev/null || return 1
+}
+
+# A pure jj Git store is bare and has no index. Build a private index from the
+# working-copy parent so Git can compare the jj work tree with HEAD.
+prepare_pure_git_index() {
+    local git_dir="$1"
+    export GIT_INDEX_FILE="$git_dir/agent-command-guards.index"
+    "$REAL_GIT" --git-dir="$git_dir" read-tree HEAD 2>/dev/null
+}
+
+# For read-oriented commands and branch inspection, export jj state, point Git
+# HEAD at the jj working-copy parent, then delegate to real git.
+if [[ "$SUBCMD" =~ ^(show|diff|log|status|branch)$ ]]; then
+    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
+        if jj_export_with_retry "$jj_root"; then
+            if git_dir="$(get_jj_git_dir "$jj_root")" && sync_git_head "$git_dir" "$jj_root"; then
+                if [[ -e "$jj_root/.git" ]]; then
+                    # Co-located: real git sees the work tree normally.
+                    exec "$REAL_GIT" "$@"
+                else
+                    # Pure jj uses a bare Git store, so provide its work tree.
+                    if [[ "$SUBCMD" == "log" ]] && ! "$REAL_GIT" --git-dir="$git_dir" rev-parse HEAD &>/dev/null; then
+                        exec "$REAL_GIT" --git-dir="$git_dir" "$SUBCMD" --branches "${SUBCMD_ARGS[@]}"
+                    else
+                        if [[ "$SUBCMD" == "diff" || "$SUBCMD" == "status" ]]; then
+                            prepare_pure_git_index "$git_dir" || exit 1
+                        fi
+                        exec "$REAL_GIT" --git-dir="$git_dir" --work-tree="$jj_root" "$@"
+                    fi
+                fi
+            fi
+        fi
+        # Fall through if export failed
+    fi
+fi
+
+# In jj repos, git add is a no-op (jj auto-tracks via snapshot.auto-track).
+if [[ "$SUBCMD" == "add" ]]; then
+    if find_jj_root "$GIT_SEARCH_DIR" &>/dev/null; then
+        exit 0
+    fi
+fi
+
+# In jj repos, translate git commit to jj commit / jj describe.
+if [[ "$SUBCMD" == "commit" ]]; then
+    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
+        local_args=()
+        amend=false
+        for arg in "${SUBCMD_ARGS[@]}"; do
+            case "$arg" in
+                --amend) amend=true ;;
+                # Flags that jj commit/describe also accepts
+                -m|--message|-m=*|--message=*) local_args+=("$arg") ;;
+                # Skip git-only flags: -a, --all, -p, --patch, etc.
+                -a|--all|-p|--patch|--allow-empty|--no-edit) ;;
+                # Pass through anything else (e.g. the message after -m)
+                *) local_args+=("$arg") ;;
+            esac
+        done
+        cd -- "$GIT_SEARCH_DIR"
+        if $amend; then
+            exec jj -R "$jj_root" describe "${local_args[@]}"
+        else
+            exec jj -R "$jj_root" commit "${local_args[@]}"
+        fi
+    fi
+fi
+
+# Map git worktree subcommands to jj workspace equivalents in jj repos.
+handle_worktree() {
+    local jj_root="$1"
+    shift
+    local worktree_subcmd="${1:-}"
+    shift
+
+    case "$worktree_subcmd" in
+        add)
+            # Parse: git worktree add [flags] <path> [<commit-ish>]
+            # -b/-B <branch> and --detach don't have jj equivalents; we ignore them.
+            # --name is rejected because Git and jj assign workspace names differently.
+            local path="" commit="" skip_next=false
+            for arg in "$@"; do
+                if $skip_next; then skip_next=false; continue; fi
+                case "$arg" in
+                    --name|--name=*)
+                        echo "git shadow: --name is not supported; workspace name is derived from path basename" >&2
+                        exit 1
+                        ;;
+                    -b|-B|--reason) skip_next=true ;;
+                    --lock|-f|--detach|--checkout|--no-checkout|--orphan|--guess-remote) ;;
+                    -*) ;;
+                    *)
+                        if [[ -z "$path" ]]; then path="$arg"
+                        else commit="$arg"; fi
+                        ;;
+                esac
+            done
+            if [[ -z "$path" ]]; then
+                echo "git shadow: missing path for worktree add" >&2; exit 1
+            fi
+            cd -- "$GIT_SEARCH_DIR"
+            if [[ -n "$commit" ]]; then
+                exec jj -R "$jj_root" workspace add -r "$commit" "$path"
+            else
+                exec jj -R "$jj_root" workspace add "$path"
+            fi
+            ;;
+        list)
+            exec jj -R "$jj_root" workspace list
+            ;;
+        remove)
+            local path="" force=false
+            for arg in "$@"; do
+                case "$arg" in
+                    -f|--force) force=true ;;
+                    -*)
+                        echo "git shadow: unsupported worktree remove option: $arg" >&2
+                        exit 1
+                        ;;
+                    *) path="$arg" ;;
+                esac
+            done
+            if [[ -z "$path" ]]; then
+                echo "git shadow: missing path for worktree remove" >&2; exit 1
+            fi
+
+            local candidate_path="$path"
+            if [[ "$candidate_path" != /* ]]; then
+                candidate_path="$GIT_SEARCH_DIR/$candidate_path"
+            fi
+            if [[ -L "$candidate_path" ]]; then
+                echo "git shadow: refusing to remove a workspace through a symbolic link: $path" >&2
+                exit 1
+            fi
+            local resolved_path
+            resolved_path="$(cd -- "$candidate_path" 2>/dev/null && pwd -P)" || {
+                echo "git shadow: worktree path is not an existing directory: $path" >&2
+                exit 1
+            }
+            if [[ "$resolved_path" == *$'\n'* || "$resolved_path" == *$'\t'* ]]; then
+                echo "git shadow: worktree paths containing tabs or newlines are unsupported" >&2
+                exit 1
+            fi
+
+            local resolved_jj_root
+            resolved_jj_root="$(cd -- "$jj_root" && pwd -P)"
+            if [[ "$resolved_path" == "/" || "$resolved_path" == "$resolved_jj_root" ]]; then
+                echo "git shadow: refusing to remove the primary workspace: $path" >&2
+                exit 1
+            fi
+            local resolved_pwd
+            resolved_pwd="$(pwd -P)"
+            if [[ "$resolved_pwd" == "$resolved_path" || "$resolved_pwd" == "$resolved_path/"* ]]; then
+                echo "git shadow: refusing to remove the current directory or its ancestor: $path" >&2
+                exit 1
+            fi
+
+            local workspace_rows name="" recorded_name recorded_root canonical_root
+            workspace_rows="$(jj -R "$jj_root" workspace list -T 'name ++ "\t" ++ root ++ "\n"')"
+            while IFS=$'\t' read -r recorded_name recorded_root; do
+                [[ -d "$recorded_root" ]] || continue
+                canonical_root="$(cd -- "$recorded_root" && pwd -P)"
+                if [[ "$canonical_root" == "$resolved_path" ]]; then
+                    name="$recorded_name"
+                    break
+                fi
+            done <<< "$workspace_rows"
+            if [[ -z "$name" ]]; then
+                echo "git shadow: path is not a registered jj workspace: $path" >&2
+                exit 1
+            fi
+
+            if ! $force; then
+                local changes
+                changes="$(jj -R "$resolved_path" diff --summary)"
+                if [[ -n "$changes" ]]; then
+                    echo "git shadow: workspace has changes; use -f to remove it: $path" >&2
+                    exit 1
+                fi
+
+                local removal_git_dir workspace_commit removal_index extra_files
+                removal_git_dir="$(get_jj_git_dir "$jj_root")" || exit 1
+                workspace_commit="$(jj -R "$resolved_path" log -r @ --no-graph -T commit_id)"
+                removal_index="$removal_git_dir/agent-command-guards.index"
+                GIT_INDEX_FILE="$removal_index" "$REAL_GIT" \
+                    --git-dir="$removal_git_dir" read-tree "$workspace_commit"
+                extra_files="$(
+                    GIT_INDEX_FILE="$removal_index" "$REAL_GIT" \
+                        --git-dir="$removal_git_dir" --work-tree="$resolved_path" \
+                        ls-files --others --exclude-standard -- ':!.jj' ':!.jj/**'
+                    GIT_INDEX_FILE="$removal_index" "$REAL_GIT" \
+                        --git-dir="$removal_git_dir" --work-tree="$resolved_path" \
+                        ls-files --others --ignored --exclude-standard -- \
+                        ':!.jj' ':!.jj/**'
+                )"
+                if [[ -n "$extra_files" ]]; then
+                    echo "git shadow: workspace has untracked or ignored files; use -f to remove it: $path" >&2
+                    exit 1
+                fi
+            fi
+
+            echo "git shadow: removing $resolved_path and forgetting jj workspace $name" >&2
+            rm -rf -- "${resolved_path:?}"
+            jj -R "$jj_root" workspace forget "$name"
+            exit 0
+            ;;
+        prune)
+            exec jj -R "$jj_root" workspace update-stale
+            ;;
+        *)
+            echo "git shadow: 'git worktree $worktree_subcmd' not mapped in jj repos; falling through to real git" >&2
+            return 1
+            ;;
+    esac
+}
+
+if [[ "$SUBCMD" == "worktree" ]]; then
+    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
+        if handle_worktree "$jj_root" "${SUBCMD_ARGS[@]}"; then
+            true  # handled via exec/exit inside handle_worktree
+        fi
+        # Unknown worktree subcmd falls through to real git below
+    fi
+fi
+
+# For all other commands, warn if jj is present and delegate.
+maybe_warn_about_jj() {
+    local root
+    if ! root="$("$REAL_GIT" rev-parse --show-toplevel 2>/dev/null)"; then
+        return
+    fi
+
+    if [[ -e "$root/.git" && -e "$root/.jj" ]]; then
+        echo "Note that this project uses jujutsu" >&2
+    fi
+}
+
+maybe_warn_about_jj
+exec "$REAL_GIT" "$@"

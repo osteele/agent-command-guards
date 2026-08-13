@@ -1,0 +1,278 @@
+"""Tests for the local resident-memory guard and uv shadow."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+GUARD = HERE / "ram-guard"
+UV_SHADOW = HERE / "uv"
+
+loader = importlib.machinery.SourceFileLoader("ram_guard", str(GUARD))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+if spec is None or spec.loader is None:
+    raise RuntimeError("could not load ram-guard")
+ram_guard = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ram_guard
+spec.loader.exec_module(ram_guard)
+
+
+class SizeParsingTest(unittest.TestCase):
+    def test_binary_sizes(self) -> None:
+        self.assertEqual(ram_guard.parse_size("8G"), 8 * 1024**3)
+        self.assertEqual(ram_guard.parse_size("512MiB"), 512 * 1024**2)
+
+    def test_rejects_non_finite_sizes(self) -> None:
+        for value in ("inf", "infG", "nan", "-infM"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(ram_guard.argparse.ArgumentTypeError),
+            ):
+                ram_guard.parse_size(value)
+
+
+class AvailableMemoryTest(unittest.TestCase):
+    def test_parses_macos_memory_pressure(self) -> None:
+        output = (
+            "The system has 17179869184 (1048576 pages with a page size of 16384).\n"
+            "System-wide memory free percentage: 36%\n"
+        )
+        self.assertEqual(
+            ram_guard.parse_memory_pressure_output(output),
+            int(17179869184 * 0.36),
+        )
+
+    def test_parses_linux_meminfo(self) -> None:
+        self.assertEqual(
+            ram_guard.parse_meminfo("MemTotal: 100000 kB\nMemAvailable: 42000 kB\n"),
+            42000 * 1024,
+        )
+
+    def test_dynamic_limit_uses_configured_fraction(self) -> None:
+        original_fraction = os.environ.get("LLM_RAM_GUARD_AVAILABLE_FRACTION")
+        original_limit = os.environ.get("LLM_RAM_GUARD_LIMIT")
+        try:
+            with mock.patch.object(
+                ram_guard, "available_memory_bytes", return_value=10 * 1024**3
+            ):
+                os.environ["LLM_RAM_GUARD_AVAILABLE_FRACTION"] = "0.6"
+                os.environ.pop("LLM_RAM_GUARD_LIMIT", None)
+                limit, source, available = ram_guard.resolve_memory_limit(None)
+        finally:
+            if original_fraction is None:
+                os.environ.pop("LLM_RAM_GUARD_AVAILABLE_FRACTION", None)
+            else:
+                os.environ["LLM_RAM_GUARD_AVAILABLE_FRACTION"] = original_fraction
+            if original_limit is None:
+                os.environ.pop("LLM_RAM_GUARD_LIMIT", None)
+            else:
+                os.environ["LLM_RAM_GUARD_LIMIT"] = original_limit
+        self.assertEqual(limit, 6 * 1024**3)
+        self.assertEqual(source, "60% of 10.00 GiB available at launch")
+        self.assertEqual(available, 10 * 1024**3)
+
+
+class RamGuardIntegrationTest(unittest.TestCase):
+    def test_process_inspection_isolated_from_unrelated_memory_use(self) -> None:
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = 0
+        rows = (ram_guard.ProcessRow(4242, 1, 4242, 1024),)
+
+        with (
+            mock.patch.object(ram_guard.subprocess, "Popen", return_value=child),
+            mock.patch.object(ram_guard, "process_rows", return_value=rows),
+            mock.patch.object(
+                ram_guard, "available_memory_bytes", return_value=1
+            ) as available_memory,
+            mock.patch.object(
+                ram_guard, "terminate_child", return_value=137
+            ) as terminate_child,
+        ):
+            result = ram_guard.run_guarded(
+                ["ignored"],
+                limit_bytes=1024**2,
+                available_at_launch=2 * 1024**2,
+                poll_seconds=0.001,
+                term_grace_seconds=0,
+            )
+
+        self.assertEqual(result, 0)
+        available_memory.assert_not_called()
+        terminate_child.assert_not_called()
+
+    def test_available_memory_floor_is_fallback_for_restricted_sandboxes(
+        self,
+    ) -> None:
+        child = mock.Mock(pid=4242)
+        with (
+            mock.patch.object(ram_guard.subprocess, "Popen", return_value=child),
+            mock.patch.object(
+                ram_guard,
+                "process_rows",
+                side_effect=ram_guard.ProcessInspectionError("restricted"),
+            ),
+            mock.patch.object(ram_guard, "available_memory_bytes", return_value=1),
+            mock.patch.object(
+                ram_guard, "terminate_child", return_value=137
+            ) as terminate_child,
+        ):
+            result = ram_guard.run_guarded(
+                ["ignored"],
+                limit_bytes=1024**2,
+                available_at_launch=2 * 1024**2,
+                poll_seconds=0.001,
+                term_grace_seconds=0,
+            )
+
+        self.assertEqual(result, 137)
+        terminate_child.assert_called_once_with(child, 4242, 0, 137)
+
+    def test_passes_normal_command_and_mps_defaults(self) -> None:
+        code = (
+            "import json,os; print(json.dumps({"
+            "'active':os.environ.get('LLM_RAM_GUARD_ACTIVE'),"
+            "'high':os.environ.get('PYTORCH_MPS_HIGH_WATERMARK_RATIO'),"
+            "'low':os.environ.get('PYTORCH_MPS_LOW_WATERMARK_RATIO')}))"
+        )
+        result = subprocess.run(
+            [str(GUARD), "--limit", "128M", "--", sys.executable, "-c", code],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"active": "1", "high": "0.7", "low": "0.6"},
+        )
+
+    def test_terminates_process_tree_above_limit(self) -> None:
+        try:
+            ram_guard.process_rows()
+        except ram_guard.ProcessInspectionError:
+            self.skipTest("process-table inspection is unavailable in this sandbox")
+        code = "import time; value=bytearray(80*1024*1024); time.sleep(3)"
+        result = subprocess.run(
+            [
+                str(GUARD),
+                "--limit",
+                "32M",
+                "--poll-seconds",
+                "0.05",
+                "--term-grace-seconds",
+                "0.1",
+                "--",
+                sys.executable,
+                "-c",
+                code,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertTrue(
+            "resident-memory limit exceeded" in result.stderr
+            or "available-memory reserve reached" in result.stderr,
+            result.stderr,
+        )
+
+
+class UvShadowIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.shim_bin = self.tmp / "shims"
+        self.shim_bin.mkdir()
+        self.real_bin = self.tmp / "bin"
+        self.real_bin.mkdir()
+        dispatcher = self.shim_bin / "mise"
+        dispatcher.write_text("#!/bin/sh\nexit 99\n")
+        dispatcher.chmod(0o755)
+        (self.shim_bin / "uv").symlink_to(dispatcher)
+        self.real_uv = self.real_bin / "uv"
+        self.real_uv.write_text(
+            "#!/bin/sh\n"
+            "printf 'args=%s\\n' \"$*\"\n"
+            "printf 'active=%s\\n' \"${LLM_RAM_GUARD_ACTIVE:-}\"\n"
+            "printf 'high=%s\\n' \"${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-}\"\n"
+        )
+        self.real_uv.chmod(0o755)
+        self.environment = dict(os.environ)
+        self.environment["PATH"] = (
+            f"{HERE}:{self.shim_bin}:{self.real_bin}:/usr/bin:/bin"
+        )
+        self.environment["LLM_RAM_GUARD_LIMIT"] = "128M"
+        for name in (
+            "LLM_RAM_GUARD_ACTIVE",
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO",
+        ):
+            self.environment.pop(name, None)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_uv_run_is_guarded(self) -> None:
+        result = subprocess.run(
+            [str(UV_SHADOW), "run", "python", "experiment.py"],
+            capture_output=True,
+            check=False,
+            env=self.environment,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("args=run python experiment.py", result.stdout)
+        self.assertIn("active=1", result.stdout)
+        self.assertIn("high=0.7", result.stdout)
+
+    def test_uv_run_after_global_options_is_guarded(self) -> None:
+        for args in (
+            ["--quiet", "run", "python", "experiment.py"],
+            ["--directory", "project", "run", "python", "experiment.py"],
+            ["--color=never", "run", "python", "experiment.py"],
+        ):
+            with self.subTest(args=args):
+                result = subprocess.run(
+                    [str(UV_SHADOW), *args],
+                    capture_output=True,
+                    check=False,
+                    env=self.environment,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("active=1", result.stdout)
+
+    def test_non_run_and_explicit_bypass_are_not_guarded(self) -> None:
+        for args, overrides in (
+            (["sync"], {}),
+            (["--project", "run", "sync"], {}),
+            (["tool", "run"], {}),
+            (["run", "python", "experiment.py"], {"LLM_RAM_GUARD": "off"}),
+        ):
+            with self.subTest(args=args, overrides=overrides):
+                environment = {**self.environment, **overrides}
+                result = subprocess.run(
+                    [str(UV_SHADOW), *args],
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("active=", result.stdout)
+                self.assertNotIn("active=1", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
