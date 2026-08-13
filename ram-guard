@@ -18,6 +18,11 @@ DEFAULT_AVAILABLE_FRACTION = 0.70
 MINIMUM_DYNAMIC_LIMIT = 256 * 1024**2
 DEFAULT_POLL_SECONDS = 0.25
 DEFAULT_TERM_GRACE_SECONDS = 2.0
+# Consecutive failed inspections before falling back to the available-memory
+# floor. `ps` can miss its deadline on a loaded host, and the floor cannot tell
+# this tree's growth from the rest of the system's, so a lone slow sample must
+# not cost the run its precise ceiling.
+INSPECTION_FAILURE_TOLERANCE = 3
 DEFAULT_MPS_HIGH_WATERMARK_RATIO = "0.7"
 DEFAULT_MPS_LOW_WATERMARK_RATIO = "0.6"
 
@@ -312,7 +317,8 @@ def run_guarded(
     )
     process_group = child.pid
     forwarded_signal: int | None = None
-    process_inspection_available = True
+    inspection_failures = 0
+    inspection_degraded = False
     availability_floor = (
         max(available_at_launch - limit_bytes, 0)
         if available_at_launch is not None
@@ -332,43 +338,58 @@ def run_guarded(
     try:
         while True:
             owned: tuple[ProcessRow, ...] = ()
-            if process_inspection_available:
-                try:
-                    rows = process_rows()
-                except ProcessInspectionError as error:
-                    process_inspection_available = False
+            # Keep inspecting even while degraded, so a run that recovers gets
+            # its resident-memory ceiling back instead of finishing under the
+            # coarser floor.
+            try:
+                rows = process_rows()
+            except ProcessInspectionError as error:
+                inspection_failures += 1
+                if (
+                    not inspection_degraded
+                    and inspection_failures >= INSPECTION_FAILURE_TOLERANCE
+                ):
+                    inspection_degraded = True
                     print(
-                        "ram-guard: process inspection unavailable "
-                        f"({error}); enforcing the available-memory floor",
+                        "ram-guard: process inspection unavailable after "
+                        f"{inspection_failures} attempts ({error}); enforcing "
+                        "the available-memory floor",
                         file=sys.stderr,
                     )
-                else:
-                    owned = guarded_processes(rows, child.pid, process_group)
-                    rss_bytes = sum(row.rss_bytes for row in owned)
-                    if rss_bytes >= limit_bytes:
-                        print(
-                            "ram-guard: resident-memory limit exceeded: "
-                            f"{format_size(rss_bytes)} >= {format_size(limit_bytes)}; "
-                            f"terminating process group {process_group}",
-                            file=sys.stderr,
-                        )
-                        return terminate_child(
-                            child, process_group, term_grace_seconds, 137
-                        )
+            else:
+                if inspection_degraded:
+                    inspection_degraded = False
+                    print(
+                        "ram-guard: process inspection recovered; enforcing the "
+                        "resident-memory ceiling again",
+                        file=sys.stderr,
+                    )
+                inspection_failures = 0
+                owned = guarded_processes(rows, child.pid, process_group)
+                rss_bytes = sum(row.rss_bytes for row in owned)
+                if rss_bytes >= limit_bytes:
+                    print(
+                        "ram-guard: resident-memory limit exceeded: "
+                        f"{format_size(rss_bytes)} >= {format_size(limit_bytes)}; "
+                        f"terminating process group {process_group}",
+                        file=sys.stderr,
+                    )
+                    return terminate_child(
+                        child, process_group, term_grace_seconds, 137
+                    )
 
-            if not process_inspection_available and availability_floor is not None:
+            if inspection_degraded and availability_floor is not None:
                 try:
                     current_available = available_memory_bytes()
                 except MemoryAvailabilityError as error:
-                    if not process_inspection_available:
-                        print(
-                            "ram-guard: both memory monitors are unavailable: "
-                            f"{error}; terminating process group {process_group}",
-                            file=sys.stderr,
-                        )
-                        return terminate_child(
-                            child, process_group, term_grace_seconds, 70
-                        )
+                    print(
+                        "ram-guard: both memory monitors are unavailable: "
+                        f"{error}; terminating process group {process_group}",
+                        file=sys.stderr,
+                    )
+                    return terminate_child(
+                        child, process_group, term_grace_seconds, 70
+                    )
                 else:
                     if current_available <= availability_floor:
                         print(
@@ -382,7 +403,7 @@ def run_guarded(
                             child, process_group, term_grace_seconds, 137
                         )
 
-            if not process_inspection_available and availability_floor is None:
+            if inspection_degraded and availability_floor is None:
                 print(
                     "ram-guard: no usable memory monitor; terminating process group "
                     f"{process_group}",

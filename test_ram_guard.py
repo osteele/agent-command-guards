@@ -109,10 +109,78 @@ class RamGuardIntegrationTest(unittest.TestCase):
         available_memory.assert_not_called()
         terminate_child.assert_not_called()
 
+    def test_transient_inspection_failure_keeps_the_resident_ceiling(self) -> None:
+        # A lone slow `ps` must not hand the run to the available-memory floor,
+        # which would terminate this tree for memory the rest of the host used.
+        child = mock.Mock(pid=4242)
+        child.poll.side_effect = [None, 0]
+        rows = (ram_guard.ProcessRow(4242, 1, 4242, 1024),)
+
+        with (
+            mock.patch.object(ram_guard.subprocess, "Popen", return_value=child),
+            mock.patch.object(
+                ram_guard,
+                "process_rows",
+                side_effect=[ram_guard.ProcessInspectionError("slow"), rows],
+            ),
+            mock.patch.object(
+                ram_guard, "available_memory_bytes", return_value=1
+            ) as available_memory,
+            mock.patch.object(
+                ram_guard, "terminate_child", return_value=137
+            ) as terminate_child,
+        ):
+            result = ram_guard.run_guarded(
+                ["ignored"],
+                limit_bytes=1024**2,
+                available_at_launch=2 * 1024**2,
+                poll_seconds=0.001,
+                term_grace_seconds=0,
+            )
+
+        self.assertEqual(result, 0)
+        available_memory.assert_not_called()
+        terminate_child.assert_not_called()
+
+    def test_recovered_inspection_resumes_the_resident_ceiling(self) -> None:
+        child = mock.Mock(pid=4242)
+        child.poll.return_value = None
+        over_limit = (ram_guard.ProcessRow(4242, 1, 4242, 4 * 1024**2),)
+        failures = [ram_guard.ProcessInspectionError("slow")] * (
+            ram_guard.INSPECTION_FAILURE_TOLERANCE + 1
+        )
+
+        with (
+            mock.patch.object(ram_guard.subprocess, "Popen", return_value=child),
+            mock.patch.object(
+                ram_guard, "process_rows", side_effect=[*failures, over_limit]
+            ),
+            # Well clear of the floor, so nothing terminates while degraded.
+            mock.patch.object(
+                ram_guard, "available_memory_bytes", return_value=1024**4
+            ) as available_memory,
+            mock.patch.object(
+                ram_guard, "terminate_child", return_value=137
+            ) as terminate_child,
+        ):
+            result = ram_guard.run_guarded(
+                ["ignored"],
+                limit_bytes=1024**2,
+                available_at_launch=2 * 1024**2,
+                poll_seconds=0.001,
+                term_grace_seconds=0,
+            )
+
+        self.assertEqual(result, 137)
+        # The floor was consulted while degraded, then the ceiling took over.
+        available_memory.assert_called()
+        terminate_child.assert_called_once_with(child, 4242, 0, 137)
+
     def test_available_memory_floor_is_fallback_for_restricted_sandboxes(
         self,
     ) -> None:
         child = mock.Mock(pid=4242)
+        child.poll.return_value = None
         with (
             mock.patch.object(ram_guard.subprocess, "Popen", return_value=child),
             mock.patch.object(
