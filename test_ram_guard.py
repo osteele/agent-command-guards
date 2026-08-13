@@ -178,7 +178,11 @@ class RamGuardIntegrationTest(unittest.TestCase):
             capture_output=True,
             check=False,
             text=True,
-            timeout=5,
+            # Only a deadlock backstop, not a speed assertion. The guarded run
+            # normally finishes well under a second, but interpreter start plus
+            # one `ps` poll is wall-clock work; on a loaded host a tight budget
+            # turns this into a spurious TimeoutExpired error.
+            timeout=120,
         )
         self.assertEqual(result.returncode, 137, result.stderr)
         self.assertTrue(
