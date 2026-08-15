@@ -1,0 +1,185 @@
+#!/bin/bash
+#
+# Generic launcher that activates the command guards for one agent CLI.
+#
+# Invoked through a symlink named for the agent it launches (kimi, opencode).
+# The symlink name selects the real binary to find and whether that agent needs
+# the Zsh bridge; everything else is shared.
+
+set -euo pipefail
+
+SCRIPT_PATH="$(realpath "$0")"
+LAUNCHER_DIR="$(dirname "$SCRIPT_PATH")"
+NAME="$(basename "$0")"
+DEFAULT_SHADOW_DIR="$LAUNCHER_DIR"
+SHADOW_DIR="${AGENT_LAUNCHER_PREPEND_PATH:-$DEFAULT_SHADOW_DIR}"
+SHELL_INIT_DIR="$LAUNCHER_DIR/launchers/shell-init"
+
+if [[ "$NAME" == "agent-launcher" ]]; then
+    printf 'Error: run %s through an agent-named symlink, not directly\n' \
+        "$SCRIPT_PATH" >&2
+    exit 2
+fi
+
+# Installers that place the real binary outside the directories a login shell
+# puts on PATH. Consulted only after the PATH search comes up empty.
+fallback_candidates() {
+    case "$NAME" in
+        kimi) printf '%s\n' "$HOME/.kimi-code/bin/kimi" ;;
+        opencode) printf '%s\n' "/opt/homebrew/bin/opencode" ;;
+    esac
+}
+
+# Agents that re-source the user's Zsh configuration for their shell tool. That
+# restores mise shims -- including a competing `uv` -- ahead of the shadows, so
+# these need PATH restored after each startup file runs.
+needs_shell_bridge() {
+    case "$NAME" in
+        opencode) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_real_binary() {
+    local candidate real_candidate
+
+    while IFS= read -r candidate; do
+        real_candidate="$(realpath "$candidate" 2>/dev/null || true)"
+        if [[ -n "$real_candidate" && "$real_candidate" != "$SCRIPT_PATH" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(which -a "$NAME" 2>/dev/null)
+
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        real_candidate="$(realpath "$candidate" 2>/dev/null || true)"
+        if [[ -n "$real_candidate" && "$real_candidate" != "$SCRIPT_PATH" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(fallback_candidates)
+
+    printf 'Error: Could not find the real %s binary after %s\n' \
+        "$NAME" "$SCRIPT_PATH" >&2
+    return 1
+}
+
+prepend_path_once() {
+    local directory="$1"
+    local entry
+    local updated="$directory"
+    local IFS=':'
+
+    for entry in $PATH; do
+        if [[ -n "$entry" && "$entry" != "$directory" ]]; then
+            updated="$updated:$entry"
+        fi
+    done
+    PATH="$updated"
+    export PATH
+}
+
+doctor() {
+    local failed=false
+    local real_binary active
+
+    printf '%s Launcher Health Check\n\n' "$NAME"
+    printf 'OK   Launcher: %s\n' "$SCRIPT_PATH"
+
+    if real_binary="$(find_real_binary)"; then
+        printf 'OK   Real %s: %s\n' "$NAME" "$real_binary"
+    else
+        printf 'FAIL Real %s: not found\n' "$NAME"
+        failed=true
+    fi
+
+    if [[ -x "$SHADOW_DIR/git" ]]; then
+        printf 'OK   Git shadow: %s\n' "$SHADOW_DIR/git"
+    else
+        printf 'WARN Git shadow: %s/git is missing or not executable\n' "$SHADOW_DIR"
+    fi
+
+    if [[ -x "$SHADOW_DIR/uv" && -x "$SHADOW_DIR/ram-guard" ]]; then
+        printf 'OK   UV RAM guard: %s\n' "$SHADOW_DIR/uv"
+    else
+        printf 'WARN UV RAM guard is incomplete under %s\n' "$SHADOW_DIR"
+    fi
+
+    if needs_shell_bridge; then
+        if [[ -f "$SHELL_INIT_DIR/.zshenv" ]]; then
+            printf 'OK   Zsh bridge: %s\n' "$SHELL_INIT_DIR"
+        else
+            printf 'FAIL Zsh bridge: %s/.zshenv is missing\n' "$SHELL_INIT_DIR"
+            failed=true
+        fi
+    else
+        printf 'OK   Zsh bridge: not required by %s\n' "$NAME"
+    fi
+
+    active="$(command -v "$NAME" 2>/dev/null || true)"
+    if [[ -n "$active" && "$(realpath "$active")" == "$SCRIPT_PATH" ]]; then
+        printf 'OK   Launcher is first on PATH\n'
+    else
+        printf 'WARN Launcher is not first on PATH (found %s)\n' "${active:-nothing}"
+    fi
+
+    if $failed; then
+        return 1
+    fi
+}
+
+if [[ "${1:-}" == "wrapper" ]]; then
+    case "${2:-}" in
+        doctor)
+            doctor
+            exit $?
+            ;;
+        path)
+            printf '%s\n' "$SCRIPT_PATH"
+            exit 0
+            ;;
+    esac
+fi
+
+new_session_id() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+    else
+        printf 'agent-%s-%s\n' "$$" "$(date +%s)"
+    fi
+}
+
+REAL_BINARY="$(find_real_binary)"
+
+# Per-session identity, so agent-mail can address one of several sessions
+# sharing a directory instead of broadcasting to all of them.
+#
+# The agents launched here export no per-session id of their own: opencode
+# exports only OPENCODE_PID and a per-workspace id, and kimi reads
+# KIMI_SESSION_ID without ever setting it. Without an id minted here, agent-mail
+# falls back to a UUID generated inside its own MCP server, which no sibling
+# subprocess could ever learn -- so such a session cannot be addressed at all.
+#
+# Unset the native ids first, and mint unconditionally. Both are about nesting:
+# an agent launched from inside another agent's shell inherits that parent's
+# CLAUDE_CODE_SESSION_ID (verified) and would otherwise answer to the parent's
+# identity, which is worse than broadcasting -- work would be attributed to one
+# specific wrong session.
+unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+AGENT_SESSION_ID="$(new_session_id)"
+export AGENT_SESSION_ID
+
+if [[ -x "$SHADOW_DIR/git" ]]; then
+    prepend_path_once "$SHADOW_DIR"
+    export AGENT_COMMAND_GUARDS_ACTIVE=1
+    export AGENT_COMMAND_GUARDS_DIR="$SHADOW_DIR"
+    if needs_shell_bridge && [[ -f "$SHELL_INIT_DIR/.zshenv" ]]; then
+        if [[ "${ZDOTDIR:-}" != "$SHELL_INIT_DIR" ]]; then
+            export AGENT_LAUNCHER_ORIGINAL_ZDOTDIR="${ZDOTDIR:-$HOME}"
+        fi
+        export ZDOTDIR="$SHELL_INIT_DIR"
+    fi
+fi
+
+exec "$REAL_BINARY" "$@"

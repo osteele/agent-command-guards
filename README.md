@@ -10,15 +10,57 @@ belong to the launchers and hooks instead.
 
 ## Installation
 
-Add this directory to the beginning of your PATH:
+This directory belongs on `PATH` only inside an agent session. Putting it on
+`PATH` for ordinary shells shadows `uv` for every command the user runs, which
+floods tools that invoke `uv run` per file -- `jj fix` is the usual casualty.
+
+Each agent gets there through its own launcher:
+
+| Agent | Launcher |
+| --- | --- |
+| Claude Code | `claude-wrapper`, via its `prepend_path` setting |
+| Codex | `codex-wrapper`, verified with `codex wrapper doctor` |
+| Kimi, opencode | `agent-launcher` in this repository (see below) |
+
+## Agent launchers
+
+`agent-launcher` is a generic launcher invoked through a symlink named for the
+agent it starts. The symlink name selects the real binary to resolve and whether
+that agent needs the Zsh bridge; the rest is shared.
 
 ```bash
-export PATH="$HOME/code/agent-tools/agent-command-guards:$PATH"
+./launchers/setup            # install
+./launchers/setup --dry-run  # preview
+./launchers/setup --uninstall
 ```
 
-`claude-wrapper` can prepend the directory through its `prepend_path` setting.
-`codex-wrapper` prepends it automatically and verifies the installation with
-`codex wrapper doctor`.
+Setup links `~/bin/kimi` and `~/bin/opencode` to the launchers and adds a
+managed block to `~/.zshenv` and `~/.bashrc` that prepends `launchers/` to
+`PATH`. That subdirectory holds only the launchers, so making it globally
+visible does not make the command shadows globally visible. Verify with:
+
+```bash
+kimi wrapper doctor
+opencode wrapper doctor
+```
+
+Adding another agent takes a symlink in `launchers/` plus, if its installer puts
+the binary somewhere a login shell would not find, an entry in the launcher's
+`fallback_candidates`.
+
+### The Zsh bridge
+
+`launchers/shell-init` is a private `ZDOTDIR` whose startup files source the
+user's own configuration and then restore the shadow directory to the front of
+`PATH`. Agents need it only if they re-source shell configuration for their
+shell tool, because doing so puts mise's `uv` shim back ahead of the shadows.
+
+- `opencode` takes a shell snapshot that sources `${ZDOTDIR:-$HOME}/.zshrc`, so
+  it gets the bridge.
+- `kimi` runs tool commands through `sh -c`, which reads no startup files, so it
+  inherits `PATH` directly and does not.
+
+The bridge covers Zsh only; an agent that snapshots Bash would need its own.
 
 ## Commands
 
@@ -72,8 +114,10 @@ invocation explicitly:
 LLM_RAM_GUARD=off uv run python large-intentional-job.py
 ```
 
-The selected ceiling is printed when the command starts. Set
-`LLM_RAM_GUARD_QUIET=1` to suppress that line. The snapshot is intentionally
+The selected ceiling is printed when the command starts, but only when stderr is
+a terminal, so tools that capture stderr per invocation (`jj fix` runs a
+formatter once per file per revision) are not flooded with banners. Set
+`LLM_RAM_GUARD_QUIET=1` to suppress the line. The snapshot is intentionally
 taken immediately before launch; it cannot reserve memory against unrelated
 processes that grow later.
 

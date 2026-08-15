@@ -1,0 +1,143 @@
+#!/bin/bash
+#
+# Install the agent launchers (kimi, opencode) ahead of their real binaries.
+#
+# The launchers live in this directory rather than the repository root so that
+# putting them on PATH does not also put the command shadows there. Only the
+# agent launchers themselves become globally visible; ssh, scp, rsync, git, and
+# uv stay shadowed inside agent sessions alone.
+
+set -euo pipefail
+
+LAUNCHER_DIR="$(cd "$(dirname "$0")" && pwd)"
+LAUNCHER_TARGET="$(cd "$LAUNCHER_DIR/.." && pwd)/agent-launcher"
+CONFIG_DIR="$HOME/.config/agent-launchers"
+ENV_FILE="$CONFIG_DIR/env"
+BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
+BLOCK_START="# >>> agent-launchers initialize >>>"
+BLOCK_END="# <<< agent-launchers initialize <<<"
+AGENTS=(kimi opencode)
+
+DRY_RUN=false
+UNINSTALL=false
+
+usage() {
+    printf 'Usage: %s [--dry-run | --uninstall]\n' "$0"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        --uninstall) UNINSTALL=true ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+remove_block() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    grep -qF "$BLOCK_START" "$file" || return 0
+    if $DRY_RUN; then
+        printf 'Would remove managed block from %s\n' "$file"
+        return 0
+    fi
+    sed -i '' "/$BLOCK_START/,/$BLOCK_END/d" "$file"
+    printf 'Removed managed block from %s\n' "$file"
+}
+
+add_block() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    if grep -qF "$BLOCK_START" "$file"; then
+        printf 'Already configured: %s\n' "$file"
+        return 0
+    fi
+    if $DRY_RUN; then
+        printf 'Would add managed block to %s\n' "$file"
+        return 0
+    fi
+    printf '\n%s\n%s\n%s\n%s\n' \
+        "$BLOCK_START" \
+        '# !! Contents within this block are managed by agent-command-guards/launchers/setup !!' \
+        ". \"\$HOME/.config/agent-launchers/env\"" \
+        "$BLOCK_END" >> "$file"
+    printf 'Configured: %s\n' "$file"
+}
+
+if $UNINSTALL; then
+    remove_block "$HOME/.zshenv"
+    remove_block "$HOME/.bashrc"
+    if [[ -f "$ENV_FILE" ]]; then
+        if $DRY_RUN; then
+            printf 'Would remove %s\n' "$ENV_FILE"
+        else
+            rm "$ENV_FILE"
+            printf 'Removed %s\n' "$ENV_FILE"
+        fi
+    fi
+    for agent in "${AGENTS[@]}"; do
+        link="$BIN_DIR/$agent"
+        if [[ -L "$link" && "$(realpath "$link")" == "$LAUNCHER_TARGET" ]]; then
+            if $DRY_RUN; then
+                printf 'Would remove %s\n' "$link"
+            else
+                rm "$link"
+                printf 'Removed %s\n' "$link"
+            fi
+        fi
+    done
+    exit 0
+fi
+
+for agent in "${AGENTS[@]}"; do
+    if [[ ! -L "$LAUNCHER_DIR/$agent" ]]; then
+        printf 'Error: %s/%s is missing\n' "$LAUNCHER_DIR" "$agent" >&2
+        exit 1
+    fi
+done
+
+if $DRY_RUN; then
+    printf 'Would create %s and prepend %s to PATH\n' "$ENV_FILE" "$LAUNCHER_DIR"
+else
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n%s\n' \
+        '# agent-launchers shell setup (managed by agent-command-guards/launchers/setup)' \
+        "export PATH=\"$LAUNCHER_DIR:\$PATH\"" > "$ENV_FILE"
+    printf 'Generated %s\n' "$ENV_FILE"
+    mkdir -p "$BIN_DIR"
+fi
+
+for agent in "${AGENTS[@]}"; do
+    link="$BIN_DIR/$agent"
+    if $DRY_RUN; then
+        printf 'Would link %s to %s/%s\n' "$link" "$LAUNCHER_DIR" "$agent"
+        continue
+    fi
+    if [[ -e "$link" || -L "$link" ]]; then
+        if [[ ! -L "$link" || "$(realpath "$link")" != "$LAUNCHER_TARGET" ]]; then
+            printf 'Error: Refusing to replace existing %s\n' "$link" >&2
+            exit 1
+        fi
+        printf 'Already linked: %s\n' "$link"
+    else
+        ln -s "$LAUNCHER_DIR/$agent" "$link"
+        printf 'Linked %s -> %s/%s\n' "$link" "$LAUNCHER_DIR" "$agent"
+    fi
+done
+
+add_block "$HOME/.zshenv"
+add_block "$HOME/.bashrc"
+
+if ! $DRY_RUN; then
+    printf 'Setup complete. Restart the shell or run: . %s\n' "$ENV_FILE"
+    printf 'Then verify with: kimi wrapper doctor && opencode wrapper doctor\n'
+fi
