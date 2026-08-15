@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import random
@@ -279,6 +281,164 @@ class StateRecoveryTest(unittest.TestCase):
                     with self.subTest(document=document):
                         state_file.write_text(json.dumps(document))
                         self.assertEqual(shadow_wrapper.load_state(), {})
+
+
+class HostDialogStateMachineTest(unittest.TestCase):
+    """Model-based tests for the per-host dialog/decision state machine.
+
+    The wrapper keeps a small amount of persistent state per managed host so it
+    can avoid re-prompting after the user declines the network-change dialog.
+    These tests verify that the real state transitions match a simple model for
+    generated sequences of probe outcomes and user responses.
+    """
+
+    HOSTS = sorted(shadow_wrapper.TARGET_HOSTS)
+    WALK_SEEDS = (20260813, 20260814, 20260815, 20260816, 20260817)
+
+    def _model_to_fields(self, model_state: str) -> tuple[bool, bool]:
+        """Return (declined, was_accessible) for a model state name."""
+        return {
+            "UNKNOWN": (False, False),
+            "ACCESSIBLE": (False, True),
+            "INACCESSIBLE": (False, False),
+            "DECLINED": (True, False),
+        }[model_state]
+
+    def _expected_transition(
+        self, model: dict[str, str], host: str, event: str
+    ) -> tuple[str, bool, bool]:
+        """Given a model state and event, return (new_state, return_value, dialog_shown)."""
+        state = model.get(host, "UNKNOWN")
+        if event == "success":
+            return "ACCESSIBLE", True, False
+        if state == "DECLINED":
+            return state, False, False
+        if event == "fail_accept":
+            return "INACCESSIBLE", True, True
+        # event == "fail_decline"
+        return "DECLINED", False, True
+
+    def _assert_state_matches_model(
+        self, model: dict[str, str], actual: dict[str, shadow_wrapper.HostState]
+    ) -> None:
+        """Compare the on-disk state to the model, ignoring timestamps."""
+        self.assertEqual(set(actual.keys()), set(model.keys()))
+        for host, model_state in model.items():
+            declined, was_accessible = self._model_to_fields(model_state)
+            host_state = actual[host]
+            self.assertEqual(host_state.declined, declined, f"{host} declined mismatch")
+            self.assertEqual(
+                host_state.was_accessible, was_accessible, f"{host} was_accessible mismatch"
+            )
+
+    def test_all_single_step_transitions_match_model(self) -> None:
+        """Exercise every (state, event) pair once and verify the outcome."""
+        events = ("success", "fail_accept", "fail_decline")
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            for initial_state in ("UNKNOWN", "ACCESSIBLE", "INACCESSIBLE", "DECLINED"):
+                for event in events:
+                    with self.subTest(initial_state=initial_state, event=event):
+                        state_file.write_text("{}")
+                        model: dict[str, str] = {}
+                        with mock.patch.object(shadow_wrapper, "STATE_FILE", state_file):
+                            if initial_state != "UNKNOWN":
+                                declined, was_accessible = self._model_to_fields(initial_state)
+                                seed_state = {
+                                    "beta": shadow_wrapper.HostState(
+                                        declined=declined,
+                                        last_checked="2026-08-13T19:00:00+00:00",
+                                        was_accessible=was_accessible,
+                                    )
+                                }
+                                shadow_wrapper.save_state(seed_state)
+                                model["beta"] = initial_state
+
+                            expected_state, expected_return, expected_dialog = (
+                                self._expected_transition(model, "beta", event)
+                            )
+
+                            with mock.patch.object(
+                                shadow_wrapper, "probe_host", return_value=(event == "success")
+                            ) as mock_probe:
+                                with mock.patch.object(
+                                    shadow_wrapper,
+                                    "show_network_dialog",
+                                    return_value=event.endswith("accept"),
+                                ) as mock_dialog:
+                                    with contextlib.redirect_stderr(io.StringIO()):
+                                        result = shadow_wrapper.check_host("beta", "/usr/bin/ssh")
+
+                            self.assertEqual(result, expected_return)
+                            self.assertEqual(mock_probe.call_count, 1)
+                            if expected_dialog:
+                                mock_dialog.assert_called_once_with("beta")
+                            else:
+                                mock_dialog.assert_not_called()
+
+                            if event == "success":
+                                model["beta"] = expected_state
+                            elif initial_state != "DECLINED":
+                                model["beta"] = expected_state
+
+                            self._assert_state_matches_model(
+                                model, shadow_wrapper.load_state()
+                            )
+
+    def test_random_walks_preserve_invariants(self) -> None:
+        """Generate long interleaved event sequences and check the model invariant."""
+        for seed in self.WALK_SEEDS:
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                model: dict[str, str] = {}
+                with tempfile.TemporaryDirectory() as directory:
+                    state_file = Path(directory) / "state.json"
+                    with mock.patch.object(shadow_wrapper, "STATE_FILE", state_file):
+                        with mock.patch.object(shadow_wrapper, "probe_host") as mock_probe:
+                            with mock.patch.object(
+                                shadow_wrapper, "show_network_dialog"
+                            ) as mock_dialog:
+                                for step in range(rng.randint(50, 150)):
+                                    host = rng.choice(self.HOSTS)
+                                    event = rng.choice(
+                                        ("success", "fail_accept", "fail_decline")
+                                    )
+
+                                    expected_state, expected_return, expected_dialog = (
+                                        self._expected_transition(model, host, event)
+                                    )
+
+                                    mock_probe.return_value = event == "success"
+                                    mock_dialog.return_value = event.endswith("accept")
+
+                                    with contextlib.redirect_stderr(io.StringIO()):
+                                        result = shadow_wrapper.check_host(host, "/usr/bin/ssh")
+
+                                    self.assertEqual(
+                                        result,
+                                        expected_return,
+                                        f"seed={seed} step={step} host={host} event={event}",
+                                    )
+                                    self.assertEqual(
+                                        mock_probe.call_count,
+                                        1,
+                                        f"seed={seed} step={step}",
+                                    )
+                                    if expected_dialog:
+                                        mock_dialog.assert_called_once_with(host)
+                                    else:
+                                        mock_dialog.assert_not_called()
+                                    mock_dialog.reset_mock()
+                                    mock_probe.reset_mock()
+
+                                    if event == "success" or (
+                                        event != "success" and model.get(host, "UNKNOWN") != "DECLINED"
+                                    ):
+                                        model[host] = expected_state
+
+                                    self._assert_state_matches_model(
+                                        model, shadow_wrapper.load_state()
+                                    )
 
 
 class ShadowIntegrationTest(unittest.TestCase):
