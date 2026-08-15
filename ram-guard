@@ -25,6 +25,7 @@ DEFAULT_TERM_GRACE_SECONDS = 2.0
 INSPECTION_FAILURE_TOLERANCE = 3
 DEFAULT_MPS_HIGH_WATERMARK_RATIO = "0.7"
 DEFAULT_MPS_LOW_WATERMARK_RATIO = "0.6"
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 class ProcessInspectionError(RuntimeError):
@@ -459,6 +460,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def should_announce_ceiling() -> bool:
+    """Report the ceiling only to a human watching a terminal.
+
+    Tools that capture stderr per invocation -- `jj fix` runs the formatter once
+    per file per revision -- would otherwise interleave one banner with every
+    unit of their own output.
+    """
+    if os.environ.get("LLM_RAM_GUARD_QUIET", "").lower() in TRUE_VALUES:
+        return False
+    return sys.stderr.isatty()
+
+
 def main() -> int:
     args = parse_args(sys.argv[1:])
     try:
@@ -472,12 +485,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 70
-    if os.environ.get("LLM_RAM_GUARD_QUIET", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if should_announce_ceiling():
         print(
             f"ram-guard: ceiling {format_size(limit_bytes)} ({limit_source})",
             file=sys.stderr,

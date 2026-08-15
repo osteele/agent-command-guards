@@ -81,6 +81,39 @@ class AvailableMemoryTest(unittest.TestCase):
         self.assertEqual(available, 10 * 1024**3)
 
 
+class CeilingAnnouncementTest(unittest.TestCase):
+    @staticmethod
+    def announce(*, isatty: bool, quiet: str | None) -> bool:
+        stderr = mock.Mock()
+        stderr.isatty.return_value = isatty
+        environment = {k: v for k, v in os.environ.items() if k != "LLM_RAM_GUARD_QUIET"}
+        if quiet is not None:
+            environment["LLM_RAM_GUARD_QUIET"] = quiet
+        with (
+            mock.patch.object(ram_guard.sys, "stderr", stderr),
+            mock.patch.dict(os.environ, environment, clear=True),
+        ):
+            return ram_guard.should_announce_ceiling()
+
+    def test_announces_to_a_terminal(self) -> None:
+        self.assertTrue(self.announce(isatty=True, quiet=None))
+
+    def test_silent_when_stderr_is_captured(self) -> None:
+        # `jj fix` runs the formatter once per file per revision and reports the
+        # captured stderr under each filename; a banner there is pure noise.
+        self.assertFalse(self.announce(isatty=False, quiet=None))
+
+    def test_quiet_overrides_a_terminal(self) -> None:
+        for value in ("1", "true", "YES", "on"):
+            with self.subTest(value=value):
+                self.assertFalse(self.announce(isatty=True, quiet=value))
+
+    def test_unset_quiet_values_leave_the_terminal_banner(self) -> None:
+        for value in ("0", "false", "no", ""):
+            with self.subTest(value=value):
+                self.assertTrue(self.announce(isatty=True, quiet=value))
+
+
 class RamGuardIntegrationTest(unittest.TestCase):
     def test_process_inspection_isolated_from_unrelated_memory_use(self) -> None:
         child = mock.Mock(pid=4242)
