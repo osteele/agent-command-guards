@@ -7,7 +7,7 @@ policy has nothing to say.
 
 Policy applies at the executable boundary, which catches a command however it was
 composed. Provider selection, agent permissions, and tool-request policy belong to
-the launchers and to [agent-tool-policy](../agent-tool-policy), the shared pre-tool
+the launchers and to [agent-tool-policy](https://github.com/osteele/agent-tool-policy), the shared pre-tool
 hook that also calls `ram-guard` here by absolute path.
 
 ## Layout
