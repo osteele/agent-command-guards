@@ -31,8 +31,7 @@ Each agent gets there through its own launcher:
 | Agent | Launcher |
 | --- | --- |
 | Claude Code | `claude-wrapper`, via its `prepend_path` setting |
-| Codex | `codex-wrapper`, verified with `codex wrapper doctor` |
-| Kimi, opencode | `agent-launcher` in this repository (see below) |
+| Codex, kimi, opencode | `agent-launcher` in this repository (see below) |
 
 Confirm inside a session that the guards win the lookup:
 
@@ -40,12 +39,19 @@ Confirm inside a session that the guards win the lookup:
 command -v git   # want …/agent-command-guards/shadows/git, not /usr/bin/git
 ```
 
-Two ways this fails without any error. A `prepend_path` value written in tilde
-form (`~/code/...`) enters `PATH` literally and never expands. A value that does
-expand can still land after `/usr/bin`, when something re-sources the shell
-configuration after the launcher prepended it. Either way every command resolves
-to the system binary and no guard runs. The directory appearing somewhere in
-`PATH` proves nothing; `command -v` is the check.
+Being on `PATH` is not enough, and the two ways it falls short are both silent. A
+`prepend_path` value written in tilde form (`~/code/...`) enters `PATH` literally
+and never expands. A value that does expand can still land behind `/usr/bin`,
+because an agent that re-sources shell configuration for its shell tool lets mise,
+pixi, and other version managers prepend themselves afterwards. Either way every
+command resolves to the system binary while the directory still appears in `PATH`,
+so `command -v` is the only check that means anything.
+
+`launchers/setup` handles the second case. It writes
+`~/.config/agent-launchers/env`, sourced from a managed block at the end of
+`.zshenv`, `.zshrc`, and `.bashrc`, which moves the guards directory back to the
+front whenever it is already on `PATH`. An ordinary shell has no guards directory
+on `PATH`, so the block does nothing there.
 
 ## Agent launchers
 
@@ -59,14 +65,16 @@ that agent needs the Zsh bridge; the rest is shared.
 ./launchers/setup --uninstall
 ```
 
-Setup links `~/bin/kimi` and `~/bin/opencode` to the launchers and adds a managed
-block to `~/.zshenv` and `~/.bashrc` that prepends `launchers/` to `PATH`. That
+Setup links `~/bin/kimi`, `~/bin/opencode`, and `~/bin/codex` to the launchers,
+and adds a managed block to `~/.zshenv`, `~/.zshrc`, and `~/.bashrc` that prepends
+`launchers/` to `PATH` and restores the guards to the front of it. That
 subdirectory holds only the launchers, so making it globally visible does not make
 the command shadows globally visible. Verify with:
 
 ```bash
 kimi wrapper doctor
 opencode wrapper doctor
+codex wrapper doctor
 ```
 
 Adding another agent takes a symlink in `launchers/` plus, if its installer puts
@@ -96,8 +104,8 @@ user's own configuration and then restore the shadow directory to the front of
 `PATH`. Agents need it only if they re-source shell configuration for their shell
 tool, because doing so puts mise's `uv` shim back ahead of the shadows.
 
-- `opencode` takes a shell snapshot that sources `${ZDOTDIR:-$HOME}/.zshrc`, so it
-  gets the bridge.
+- `opencode` takes a shell snapshot that sources `${ZDOTDIR:-$HOME}/.zshrc`, and
+  `codex` re-sources configuration the same way, so both get the bridge.
 - `kimi` runs tool commands through `sh -c`, which reads no startup files, so it
   inherits `PATH` directly and does not.
 

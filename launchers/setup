@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Install the agent launchers (kimi, opencode) ahead of their real binaries.
+# Install the agent launchers (kimi, opencode, codex) ahead of their real binaries.
 #
 # The launchers live in this directory rather than the repository root so that
 # putting them on PATH does not also put the command shadows there. Only the
@@ -10,13 +10,15 @@
 set -euo pipefail
 
 LAUNCHER_DIR="$(cd "$(dirname "$0")" && pwd)"
-LAUNCHER_TARGET="$(cd "$LAUNCHER_DIR/.." && pwd)/agent-launcher"
+REPO_DIR="$(cd "$LAUNCHER_DIR/.." && pwd)"
+LAUNCHER_TARGET="$REPO_DIR/agent-launcher"
+SHADOW_DIR="$REPO_DIR/shadows"
 CONFIG_DIR="$HOME/.config/agent-launchers"
 ENV_FILE="$CONFIG_DIR/env"
 BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
 BLOCK_START="# >>> agent-launchers initialize >>>"
 BLOCK_END="# <<< agent-launchers initialize <<<"
-AGENTS=(kimi opencode)
+AGENTS=(kimi opencode codex)
 
 DRY_RUN=false
 UNINSTALL=false
@@ -50,8 +52,12 @@ remove_block() {
         printf 'Would remove managed block from %s\n' "$file"
         return 0
     fi
-    sed -i '' "/$BLOCK_START/,/$BLOCK_END/d" "$file"
-    printf 'Removed managed block from %s\n' "$file"
+    # Resolve first: these files are commonly symlinks into a dotfiles
+    # repository, and in-place sed refuses to edit anything but a regular file.
+    local target
+    target="$(realpath "$file")"
+    sed -i '' "/$BLOCK_START/,/$BLOCK_END/d" "$target"
+    printf 'Removed managed block from %s\n' "$target"
 }
 
 add_block() {
@@ -75,6 +81,7 @@ add_block() {
 
 if $UNINSTALL; then
     remove_block "$HOME/.zshenv"
+    remove_block "$HOME/.zshrc"
     remove_block "$HOME/.bashrc"
     if [[ -f "$ENV_FILE" ]]; then
         if $DRY_RUN; then
@@ -109,9 +116,44 @@ if $DRY_RUN; then
     printf 'Would create %s and prepend %s to PATH\n' "$ENV_FILE" "$LAUNCHER_DIR"
 else
     mkdir -p "$CONFIG_DIR"
-    printf '%s\n%s\n' \
-        '# agent-launchers shell setup (managed by agent-command-guards/launchers/setup)' \
-        "export PATH=\"$LAUNCHER_DIR:\$PATH\"" > "$ENV_FILE"
+    cat > "$ENV_FILE" <<EOF
+# agent-launchers shell setup (managed by agent-command-guards/launchers/setup)
+export PATH="$LAUNCHER_DIR:\$PATH"
+
+# Restore the command guards to the front of PATH.
+#
+# A launcher puts the guards directory on PATH before starting its agent. Every
+# agent that re-sources shell configuration for its shell tool then lets mise,
+# pixi, and friends prepend themselves ahead of it, and the guards stop winning
+# the lookup while still appearing in PATH. Sourcing this file at the end of the
+# rc files puts them back in front.
+#
+# The guards directory is only on PATH inside an agent session, so this is a
+# no-op in an ordinary shell.
+agent_guards_restore() {
+    guards_dir="\${AGENT_COMMAND_GUARDS_DIR:-$SHADOW_DIR}"
+    case ":\$PATH:" in
+        *":\$guards_dir:"*) ;;
+        *) unset guards_dir; return 0 ;;
+    esac
+
+    guards_updated="\$guards_dir"
+    guards_saved_ifs="\$IFS"
+    IFS=':'
+    for guards_entry in \$PATH; do
+        if [ -n "\$guards_entry" ] && [ "\$guards_entry" != "\$guards_dir" ]; then
+            guards_updated="\$guards_updated:\$guards_entry"
+        fi
+    done
+    IFS="\$guards_saved_ifs"
+
+    PATH="\$guards_updated"
+    export PATH
+    unset guards_dir guards_updated guards_entry guards_saved_ifs
+}
+agent_guards_restore
+unset -f agent_guards_restore
+EOF
     printf 'Generated %s\n' "$ENV_FILE"
     mkdir -p "$BIN_DIR"
 fi
@@ -134,7 +176,10 @@ for agent in "${AGENTS[@]}"; do
     fi
 done
 
+# .zshenv puts the launchers on PATH early. .zshrc and .bashrc run afterwards and
+# let other version managers prepend themselves, so the block runs there too, last.
 add_block "$HOME/.zshenv"
+add_block "$HOME/.zshrc"
 add_block "$HOME/.bashrc"
 
 if ! $DRY_RUN; then

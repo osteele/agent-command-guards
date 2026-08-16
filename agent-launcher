@@ -27,6 +27,7 @@ fallback_candidates() {
     case "$NAME" in
         kimi) printf '%s\n' "$HOME/.kimi-code/bin/kimi" ;;
         opencode) printf '%s\n' "/opt/homebrew/bin/opencode" ;;
+        codex) printf '%s\n' "/opt/homebrew/bin/codex" ;;
     esac
 }
 
@@ -35,7 +36,7 @@ fallback_candidates() {
 # these need PATH restored after each startup file runs.
 needs_shell_bridge() {
     case "$NAME" in
-        opencode) return 0 ;;
+        opencode|codex) return 0 ;;
         *) return 1 ;;
     esac
 }
