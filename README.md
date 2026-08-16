@@ -1,18 +1,30 @@
 # Agent Command Guards
 
-Command wrappers that intercept `ssh`, `scp`, `rsync`, `git`, and `uv` to apply
-agent-specific workstation policies.
+Wrappers for `ssh`, `scp`, `rsync`, `git`, and `uv` that apply workstation policy
+to the commands an agent runs. Each wrapper does its work and hands off to the
+real binary, so a guarded command behaves like the unguarded one everywhere the
+policy has nothing to say.
 
-These wrappers enforce policy at the executable boundary. Agent launchers can
-put the directory first on `PATH`, while hooks can call individual guards by
-absolute path. Provider selection, agent permissions, and tool-request policy
-belong to the launchers and hooks instead.
+Policy applies at the executable boundary, which catches a command however it was
+composed. Provider selection, agent permissions, and tool-request policy belong to
+the launchers and to [agent-tool-policy](../agent-tool-policy), the shared pre-tool
+hook that also calls `ram-guard` here by absolute path.
+
+## Layout
+
+`shadows/` holds the wrappers and is the only directory that goes on `PATH`. It
+contains exactly what should become a command name. The repository root used to be
+the `PATH` entry, which meant any file added there became a command in every agent
+session, so a helper named `setup` or `check` would have shadowed the real one.
+
+`launchers/` follows the same rule for the agent launchers. `tests/`,
+`agent-launcher`, and the documentation stay off `PATH`.
 
 ## Installation
 
-This directory belongs on `PATH` only inside an agent session. Putting it on
-`PATH` for ordinary shells shadows `uv` for every command the user runs, which
-floods tools that invoke `uv run` per file -- `jj fix` is the usual casualty.
+`shadows/` belongs on `PATH` inside an agent session only. In an ordinary shell it
+shadows `uv` for every command the user runs, which floods tools that invoke
+`uv run` once per file. `jj fix` is the usual casualty.
 
 Each agent gets there through its own launcher:
 
@@ -21,6 +33,19 @@ Each agent gets there through its own launcher:
 | Claude Code | `claude-wrapper`, via its `prepend_path` setting |
 | Codex | `codex-wrapper`, verified with `codex wrapper doctor` |
 | Kimi, opencode | `agent-launcher` in this repository (see below) |
+
+Confirm inside a session that the guards win the lookup:
+
+```bash
+command -v git   # want …/agent-command-guards/shadows/git, not /usr/bin/git
+```
+
+Two ways this fails without any error. A `prepend_path` value written in tilde
+form (`~/code/...`) enters `PATH` literally and never expands. A value that does
+expand can still land after `/usr/bin`, when something re-sources the shell
+configuration after the launcher prepended it. Either way every command resolves
+to the system binary and no guard runs. The directory appearing somewhere in
+`PATH` proves nothing; `command -v` is the check.
 
 ## Agent launchers
 
@@ -34,10 +59,10 @@ that agent needs the Zsh bridge; the rest is shared.
 ./launchers/setup --uninstall
 ```
 
-Setup links `~/bin/kimi` and `~/bin/opencode` to the launchers and adds a
-managed block to `~/.zshenv` and `~/.bashrc` that prepends `launchers/` to
-`PATH`. That subdirectory holds only the launchers, so making it globally
-visible does not make the command shadows globally visible. Verify with:
+Setup links `~/bin/kimi` and `~/bin/opencode` to the launchers and adds a managed
+block to `~/.zshenv` and `~/.bashrc` that prepends `launchers/` to `PATH`. That
+subdirectory holds only the launchers, so making it globally visible does not make
+the command shadows globally visible. Verify with:
 
 ```bash
 kimi wrapper doctor
@@ -53,11 +78,11 @@ the binary somewhere a login shell would not find, an entry in the launcher's
 The launcher exports `AGENT_SESSION_ID`, a fresh id per launch, and unsets
 `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` first.
 
-Claude Code and Codex export a per-session id into their shell subprocesses;
-kimi and opencode export none, so tools that need to tell two sessions in one
-directory apart — agent-mail addressing a specific session rather than
-broadcasting to the whole project — have nothing to go on. `AGENT_SESSION_ID`
-fills that gap.
+Claude Code and Codex export a per-session id into their shell subprocesses. Kimi
+and opencode export none, so a tool that needs to tell two sessions in one
+directory apart has nothing to go on. Addressing agent-mail to one session rather
+than broadcasting to the whole project is the case that motivated this.
+`AGENT_SESSION_ID` fills the gap.
 
 The unset handles nesting. An agent started from inside another agent's shell
 inherits that parent's session id, and answering to it would attribute this
@@ -68,120 +93,43 @@ inherited `AGENT_SESSION_ID`.
 
 `launchers/shell-init` is a private `ZDOTDIR` whose startup files source the
 user's own configuration and then restore the shadow directory to the front of
-`PATH`. Agents need it only if they re-source shell configuration for their
-shell tool, because doing so puts mise's `uv` shim back ahead of the shadows.
+`PATH`. Agents need it only if they re-source shell configuration for their shell
+tool, because doing so puts mise's `uv` shim back ahead of the shadows.
 
-- `opencode` takes a shell snapshot that sources `${ZDOTDIR:-$HOME}/.zshrc`, so
-  it gets the bridge.
+- `opencode` takes a shell snapshot that sources `${ZDOTDIR:-$HOME}/.zshrc`, so it
+  gets the bridge.
 - `kimi` runs tool commands through `sh -c`, which reads no startup files, so it
   inherits `PATH` directly and does not.
 
-The bridge covers Zsh only; an agent that snapshots Bash would need its own.
+The bridge covers Zsh only. An agent that snapshots Bash would need its own.
 
 ## Commands
 
 ### ssh, scp, rsync
 
-Python wrappers (symlinks to `shadow_wrapper.py`) that check connectivity to managed hosts before connecting.
-
-**Managed hosts:** `alpha`, `beta`, `gamma`
-
-**Behavior:**
-1. Parse command arguments to identify target hosts
-2. If target is a managed host, probe connectivity via SSH
-3. If accessible: proceed with the command
-4. If not accessible:
-   - Show a macOS dialog asking if user wants to change network
-   - "Yes": proceed anyway (user will change network)
-   - "No": print error message and exit
-5. Remember "No" decisions per host until the host becomes accessible again
-
-**State file:** `~/.cache/agent-command-guards/state.json`
-
-### git
-
-Bash wrapper that detects when a project uses both Git and [Jujutsu](https://github.com/martinvonz/jj) version control, and reminds you to use `jj` instead.
-For read-oriented commands and branch inspection, it exports jj state and points
-Git's `HEAD` at a synthetic `jj-head` branch for the jj working-copy parent.
-In jj repositories, `git worktree` add/list/remove/prune operations map to jj
-workspace operations. Removal resolves the exact registered workspace path and
-refuses dirty workspaces unless `-f` is supplied.
-
-### uv and ram-guard
-
-The `uv` shadow delegates ordinary uv subcommands unchanged. It runs `uv run`
-under `ram-guard`, which monitors aggregate resident memory for the complete
-process tree and terminates only its owned process group when it reaches the
-limit. At each launch, the default ceiling is 70% of the memory that the host
-currently reports as available. This leaves the other 30% of currently
-available memory, plus memory already used by the rest of the system, outside
-the new process tree's budget. Settings:
-
-- `LLM_RAM_GUARD_AVAILABLE_FRACTION=0.70`
-- `LLM_RAM_GUARD_LIMIT=8G` replaces the dynamic calculation with a fixed limit
-- `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7`
-- `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.6`
-
-Existing PyTorch variables take precedence. Customize the defaults with
-`LLM_MPS_HIGH_WATERMARK_RATIO` and `LLM_MPS_LOW_WATERMARK_RATIO`, or bypass one
-invocation explicitly:
+Python wrappers, all three symlinks to `shadow_wrapper.py`, that check
+connectivity to a managed host before connecting. The managed hosts are `alpha`,
+`beta`, and `gamma`; any other target passes straight through with no probe.
 
 ```bash
-LLM_RAM_GUARD=off uv run python large-intentional-job.py
+ssh beta                        # connects normally when beta is reachable
+scp file.txt alpha:/path/dest    # asks first when alpha is unreachable
+rsync -av local/ gamma:/remote/ # probes before syncing
 ```
 
-The selected ceiling is printed when the command starts, but only when stderr is
-a terminal, so tools that capture stderr per invocation (`jj fix` runs a
-formatter once per file per revision) are not flooded with banners. Set
-`LLM_RAM_GUARD_QUIET=1` to suppress the line. The snapshot is intentionally
-taken immediately before launch; it cannot reserve memory against unrelated
-processes that grow later.
+The wrapper parses the arguments for target hosts, probes a managed one with
+`ssh -o ConnectTimeout=3 -o BatchMode=yes <host> echo ok`, and proceeds when the
+host answers. When it does not answer, a macOS dialog asks whether to continue.
+"Yes" proceeds, on the assumption the user is about to change networks. "No"
+prints an error and exits.
 
-On macOS, the snapshot comes from `memory_pressure -Q`; Linux uses
-`MemAvailable` from `/proc/meminfo`. The guard enforces aggregate process-tree
-RSS when process inspection is permitted. Restricted sandboxes that block
-process inspection use the corresponding available-memory floor.
+A "No" is remembered per host, so a second attempt fails immediately instead of
+asking again. The decision is cleared as soon as a probe succeeds. A host that was
+reachable and no longer is gets a fresh dialog rather than the remembered answer,
+since that pattern indicates a network change rather than a standing decision.
 
-The Claude/Codex shared pre-tool hook also wraps parsed `uv run` commands by an
-absolute guard path, covering absolute uv paths that bypass the shadow.
-
-## Examples
-
-```bash
-# Connects normally if beta is reachable
-ssh beta
-
-# Shows dialog if alpha is unreachable
-scp file.txt alpha:/path/to/dest
-
-# Probes host before syncing
-rsync -av local/ gamma:/remote/
-
-# Reminds you about jj if .jj directory exists
-git status  # "Note: This project uses jj..."
-```
-
-## How It Works
-
-The wrappers use `which -a` to find the real binary, skipping themselves via `realpath()` comparison. For ssh/scp/rsync:
-
-- **SSH**: Extracts host from first positional argument (after parsing options like `-p`, `-o`)
-- **SCP/rsync**: Scans transfer endpoints in `[user@]host:path`, `scp://`, and
-  `rsync://` forms
-
-Network probing uses:
-```bash
-ssh -o ConnectTimeout=3 -o BatchMode=yes <host> echo ok
-```
-
-The macOS dialog uses `osascript`:
-```applescript
-display dialog "Cannot reach <host>..." buttons {"No", "Yes"}
-```
-
-## State Management
-
-State is stored in JSON format with file locking (`fcntl.flock`) for multiprocess safety:
+State lives in `~/.cache/agent-command-guards/state.json`, written under
+`fcntl.flock` so concurrent agents do not corrupt it:
 
 ```json
 {
@@ -193,4 +141,83 @@ State is stored in JSON format with file locking (`fcntl.flock`) for multiproces
 }
 ```
 
-When a host becomes accessible again, the `declined` flag is automatically reset.
+### git
+
+A Bash wrapper for projects that use both Git and
+[Jujutsu](https://github.com/martinvonz/jj). In a repository with a `.jj`
+directory it prints a reminder to use `jj`, and for several subcommands it does
+more than remind.
+
+Read-oriented commands and branch inspection get real jj state: the wrapper runs
+`jj git export` and points Git's `HEAD` at a synthetic `jj-head` branch tracking
+the jj working-copy parent, so `git log` and `git status` describe the repository
+as jj sees it rather than a stale export.
+
+`git worktree` add, list, remove, and prune map to the corresponding `jj
+workspace` operations. Removal resolves the exact registered workspace path and
+refuses to touch the primary workspace, the current one, a symlink, or a path that
+is merely similar. A workspace holding changes or untracked files survives unless
+`-f` is supplied.
+
+### uv and ram-guard
+
+The `uv` shadow passes ordinary uv subcommands through unchanged. It runs `uv run`
+under `ram-guard`, which watches the resident memory of the whole process tree and
+terminates only its own process group on reaching the limit.
+
+The default ceiling is 70% of the memory the host reports as available at launch.
+The remaining 30%, plus everything already in use by the rest of the system, stays
+outside the new tree's budget. The snapshot is taken immediately before launch and
+cannot reserve memory against unrelated processes that grow later.
+
+| Variable | Effect |
+| --- | --- |
+| `LLM_RAM_GUARD_AVAILABLE_FRACTION` | Fraction of available memory to grant (default `0.70`) |
+| `LLM_RAM_GUARD_LIMIT` | A fixed limit such as `8G`, replacing the dynamic calculation |
+| `LLM_RAM_GUARD_QUIET` | Suppress the startup banner |
+| `LLM_RAM_GUARD=off` | Skip the guard for one invocation |
+| `LLM_MPS_HIGH_WATERMARK_RATIO` | PyTorch MPS hard watermark (default `0.7`) |
+| `LLM_MPS_LOW_WATERMARK_RATIO` | PyTorch MPS soft watermark (default `0.6`) |
+
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` and `PYTORCH_MPS_LOW_WATERMARK_RATIO` already
+in the environment take precedence over the defaults set here.
+
+```bash
+LLM_RAM_GUARD=off uv run python large-intentional-job.py
+```
+
+The chosen ceiling is announced at startup only when stderr is a terminal, so
+tools that capture stderr per invocation are not flooded. `jj fix` runs a
+formatter once per file per revision and would otherwise produce a banner each
+time.
+
+Memory comes from `memory_pressure -Q` on macOS and from `MemAvailable` in
+`/proc/meminfo` on Linux. The guard enforces aggregate process-tree RSS wherever
+process inspection is permitted, and falls back to an available-memory floor in
+sandboxes that block it.
+
+The shared pre-tool hook in agent-tool-policy wraps `uv run` a second way, by
+rewriting the command to an absolute `ram-guard` path. That covers absolute uv
+paths and `mise`/`command` prefixes, which never consult `PATH` and so never reach
+this shadow.
+
+## How the wrappers find the real binary
+
+Each wrapper has to locate the command it shadows without re-executing itself.
+`shadow_wrapper.py` and `git` scan `which -a <name>` and skip any candidate whose
+`realpath()` matches their own. `uv` walks `PATH` by hand instead, because it also
+has to skip mise shims: a shim ahead of the concrete `uv` binary hangs or recurses
+when this shadow comes earlier on `PATH`.
+
+Handoff uses `exec`, which preserves exit codes and signal behavior. `ram-guard`
+is the deliberate exception, staying resident to monitor its child.
+
+## Tests
+
+```bash
+python3 -m unittest          # from the repository root
+```
+
+The suite uses `unittest`. It drives the real wrappers as subprocesses against
+temporary repositories and fake binaries, so it exercises the files that agents
+actually run.

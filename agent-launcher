@@ -80,6 +80,30 @@ prepend_path_once() {
     export PATH
 }
 
+# The shadows moved from the repository root into shadows/ at this timestamp.
+# Root symlinks left behind serve sessions that started before the move, so they
+# are removable once the machine has booted since.
+SHADOWS_MOVED_AT=1786909200
+
+report_transitional_symlinks() {
+    local present=() link
+    for link in git ram-guard shadow_wrapper.py ssh scp rsync uv; do
+        [[ -L "$LAUNCHER_DIR/$link" ]] && present+=("$link")
+    done
+    [[ ${#present[@]} -eq 0 ]] && return 0
+
+    local booted
+    # Absent on Linux, and absent from a minimal PATH; report without it.
+    booted=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\).*/\1/p' || true)
+
+    if [[ -n "$booted" && "$booted" -gt "$SHADOWS_MOVED_AT" ]]; then
+        printf 'WARN Transitional root symlinks are now removable (booted since the shadows/ move):\n'
+        printf '       cd %s && rm %s\n' "$LAUNCHER_DIR" "${present[*]}"
+    else
+        printf 'OK   Transitional root symlinks serving pre-move sessions: %s\n' "${present[*]}"
+    fi
+}
+
 doctor() {
     local failed=false
     local real_binary active
@@ -116,6 +140,8 @@ doctor() {
     else
         printf 'OK   Zsh bridge: not required by %s\n' "$NAME"
     fi
+
+    report_transitional_symlinks
 
     active="$(command -v "$NAME" 2>/dev/null || true)"
     if [[ -n "$active" && "$(realpath "$active")" == "$SCRIPT_PATH" ]]; then
