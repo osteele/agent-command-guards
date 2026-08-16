@@ -16,8 +16,8 @@ from collections import Counter
 from pathlib import Path
 from unittest import mock
 
-HERE = Path(__file__).resolve().parent
-WRAPPER = HERE / "shadow_wrapper.py"
+SHADOWS = Path(__file__).resolve().parent.parent / "shadows"
+WRAPPER = SHADOWS / "shadow_wrapper.py"
 
 spec = importlib.util.spec_from_file_location("shadow_wrapper", WRAPPER)
 if spec is None or spec.loader is None:

@@ -8,9 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LAUNCHER = HERE / "agent-launcher"
-LAUNCHER_DIR = HERE / "launchers"
+REPO = Path(__file__).resolve().parent.parent
+SHADOWS = REPO / "shadows"
+LAUNCHER = REPO / "agent-launcher"
+LAUNCHER_DIR = REPO / "launchers"
 SHELL_INIT = LAUNCHER_DIR / "shell-init"
 
 REPORT_ENVIRONMENT = (
@@ -88,8 +89,8 @@ class AgentLauncherTest(unittest.TestCase):
         result = self.launch("kimi")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("guards=1", result.stdout)
-        self.assertIn(f"guards_dir={HERE}", result.stdout)
-        self.assertIn(f"first_on_path={HERE / 'uv'}", result.stdout)
+        self.assertIn(f"guards_dir={SHADOWS}", result.stdout)
+        self.assertIn(f"first_on_path={SHADOWS / 'uv'}", result.stdout)
 
     def test_kimi_does_not_get_the_zsh_bridge(self) -> None:
         # kimi runs tool commands through `sh -c`, which never reads zsh
@@ -172,7 +173,7 @@ class ShellBridgeTest(unittest.TestCase):
             home = Path(name)
             (home / ".zshrc").write_text('export PATH="/usr/local/bin:$PATH"\n')
             environment = dict(os.environ)
-            environment["AGENT_COMMAND_GUARDS_DIR"] = str(HERE)
+            environment["AGENT_COMMAND_GUARDS_DIR"] = str(SHADOWS)
             environment["AGENT_LAUNCHER_ORIGINAL_ZDOTDIR"] = str(home)
             environment["ZDOTDIR"] = str(SHELL_INIT)
             environment["HOME"] = str(home)
@@ -192,7 +193,7 @@ class ShellBridgeTest(unittest.TestCase):
         # The user's own .zshrc ran, and the shadows are still in front of it.
         self.assertIn("/usr/local/bin", result.stdout)
         self.assertTrue(
-            result.stdout.strip().startswith(f"{HERE}:"),
+            result.stdout.strip().startswith(f"{SHADOWS}:"),
             f"shadow directory is not first: {result.stdout.strip()[:200]}",
         )
 

@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-GIT_SHADOW = HERE / "git"
+SHADOWS = Path(__file__).resolve().parent.parent / "shadows"
+GIT_SHADOW = SHADOWS / "git"
 
 
 class GitShadowIntegrationTest(unittest.TestCase):
@@ -24,7 +24,7 @@ class GitShadowIntegrationTest(unittest.TestCase):
         self.repo = self.tmp / "repo"
         self.environment = dict(os.environ)
         self.environment["PATH"] = (
-            f"{HERE}:{self.jj.parent}:/usr/local/bin:/usr/bin:/bin"
+            f"{SHADOWS}:{self.jj.parent}:/usr/local/bin:/usr/bin:/bin"
         )
         self.run_jj("git", "init", "--no-colocate", str(self.repo), cwd=self.tmp)
         (self.repo / "tracked.txt").write_text("initial\n")

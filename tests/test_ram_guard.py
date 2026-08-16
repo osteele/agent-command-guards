@@ -13,9 +13,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HERE = Path(__file__).resolve().parent
-GUARD = HERE / "ram-guard"
-UV_SHADOW = HERE / "uv"
+SHADOWS = Path(__file__).resolve().parent.parent / "shadows"
+GUARD = SHADOWS / "ram-guard"
+UV_SHADOW = SHADOWS / "uv"
 
 loader = importlib.machinery.SourceFileLoader("ram_guard", str(GUARD))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -326,7 +326,7 @@ class UvShadowIntegrationTest(unittest.TestCase):
         self.real_uv.chmod(0o755)
         self.environment = dict(os.environ)
         self.environment["PATH"] = (
-            f"{HERE}:{self.shim_bin}:{self.real_bin}:/usr/bin:/bin"
+            f"{SHADOWS}:{self.shim_bin}:{self.real_bin}:/usr/bin:/bin"
         )
         self.environment["LLM_RAM_GUARD_LIMIT"] = "128M"
         for name in (
