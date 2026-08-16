@@ -20,6 +20,9 @@ REPORT_ENVIRONMENT = (
     'printf \'guards_dir=%s\\n\' "${AGENT_COMMAND_GUARDS_DIR:-}"\n'
     'printf \'zdotdir=%s\\n\' "${ZDOTDIR:-}"\n'
     'printf \'first_on_path=%s\\n\' "$(command -v uv)"\n'
+    'printf \'agent_session=%s\\n\' "${AGENT_SESSION_ID:-}"\n'
+    'printf \'claude_session=%s\\n\' "${CLAUDE_CODE_SESSION_ID:-}"\n'
+    'printf \'codex_thread=%s\\n\' "${CODEX_THREAD_ID:-}"\n'
 )
 
 
@@ -103,6 +106,44 @@ class AgentLauncherTest(unittest.TestCase):
         result = self.launch("opencode")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"zdotdir={SHELL_INIT}", result.stdout)
+
+    def session_id(self, result: subprocess.CompletedProcess[str]) -> str:
+        for line in result.stdout.splitlines():
+            if line.startswith("agent_session="):
+                return line.removeprefix("agent_session=")
+        self.fail(f"no agent_session line in output: {result.stdout!r}")
+
+    def test_mints_a_session_id_for_agents_that_export_none(self) -> None:
+        # kimi and opencode expose no per-session id of their own, so agent-mail
+        # cannot address one of several sessions in a directory unless the id
+        # comes from here.
+        self.install_real("kimi")
+        result = self.launch("kimi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.session_id(result), "")
+
+    def test_each_launch_gets_a_distinct_session_id(self) -> None:
+        self.install_real("kimi")
+        first = self.launch("kimi")
+        second = self.launch("kimi")
+        self.assertNotEqual(self.session_id(first), self.session_id(second))
+
+    def test_an_inherited_session_id_is_replaced_not_reused(self) -> None:
+        # An agent started from inside another agent's shell inherits that
+        # parent's ids. Answering to them would attribute this session's work to
+        # one specific wrong session, which is worse than no id at all.
+        self.install_real("kimi")
+        self.environment["AGENT_SESSION_ID"] = "parent-agent"
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "parent-claude"
+        self.environment["CODEX_THREAD_ID"] = "parent-codex"
+        result = self.launch("kimi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.session_id(result), "parent-agent")
+        self.assertNotEqual(self.session_id(result), "")
+        # The native ids resolve ahead of AGENT_SESSION_ID, so leaving either in
+        # place would let the inherited identity win anyway.
+        self.assertIn("claude_session=\n", result.stdout)
+        self.assertIn("codex_thread=\n", result.stdout)
 
     def test_missing_binary_is_reported(self) -> None:
         result = self.launch("kimi")

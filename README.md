@@ -48,6 +48,22 @@ Adding another agent takes a symlink in `launchers/` plus, if its installer puts
 the binary somewhere a login shell would not find, an entry in the launcher's
 `fallback_candidates`.
 
+### Session identity
+
+The launcher exports `AGENT_SESSION_ID`, a fresh id per launch, and unsets
+`CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` first.
+
+Claude Code and Codex export a per-session id into their shell subprocesses;
+kimi and opencode export none, so tools that need to tell two sessions in one
+directory apart — agent-mail addressing a specific session rather than
+broadcasting to the whole project — have nothing to go on. `AGENT_SESSION_ID`
+fills that gap.
+
+The unset handles nesting. An agent started from inside another agent's shell
+inherits that parent's session id, and answering to it would attribute this
+session's work to the parent. Minting unconditionally does the same for an
+inherited `AGENT_SESSION_ID`.
+
 ### The Zsh bridge
 
 `launchers/shell-init` is a private `ZDOTDIR` whose startup files source the
