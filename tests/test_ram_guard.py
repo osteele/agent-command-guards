@@ -6,9 +6,11 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -302,6 +304,63 @@ class RamGuardIntegrationTest(unittest.TestCase):
             or "available-memory reserve reached" in result.stderr,
             result.stderr,
         )
+
+    def test_sigterm_to_the_guard_reaches_the_child_group(self) -> None:
+        # An agent session that cancels a guarded run signals the guard, not
+        # the child; the guard must forward to the child's process group and
+        # report the conventional 128+signum exit code.
+        try:
+            ram_guard.process_rows()
+        except ram_guard.ProcessInspectionError:
+            self.skipTest("process-table inspection is unavailable in this sandbox")
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "child.pid"
+            code = (
+                "import os, time; "
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(30)"
+            )
+            guard = subprocess.Popen(
+                [
+                    str(GUARD),
+                    "--limit",
+                    "1G",
+                    "--poll-seconds",
+                    "0.05",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    code,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                # Keep the guard's own signal handling out of this test
+                # session's process group.
+                start_new_session=True,
+            )
+            try:
+                for _ in range(200):
+                    if pid_file.exists():
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(
+                    pid_file.exists(), "child never recorded its pid"
+                )
+                child_pid = int(pid_file.read_text())
+                os.kill(guard.pid, signal.SIGTERM)
+                stdout, stderr = guard.communicate(timeout=30)
+            finally:
+                if guard.poll() is None:
+                    guard.kill()
+                    guard.communicate()
+
+        self.assertEqual(guard.returncode, 143, stderr)
+        self.assertNotIn("limit exceeded", stderr)
+        # The forwarded signal terminated the guarded child, and the guard
+        # reaped it: the pid is gone rather than lingering under a live group.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
 
 
 class UvShadowIntegrationTest(unittest.TestCase):

@@ -282,6 +282,43 @@ class StateRecoveryTest(unittest.TestCase):
                         state_file.write_text(json.dumps(document))
                         self.assertEqual(shadow_wrapper.load_state(), {})
 
+    def test_failed_save_leaves_previous_decisions_intact(self) -> None:
+        # A crash or full disk mid-save must not replace the recorded
+        # decisions with a truncated document, and must not litter the cache
+        # directory with temporary files.
+        previous = {
+            "beta": shadow_wrapper.HostState(
+                declined=True,
+                last_checked="2026-08-13T19:00:00+00:00",
+                was_accessible=False,
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            with (
+                mock.patch.object(shadow_wrapper, "STATE_DIR", Path(directory)),
+                mock.patch.object(shadow_wrapper, "STATE_FILE", state_file),
+            ):
+                shadow_wrapper.save_state(previous)
+                with mock.patch.object(
+                    shadow_wrapper.os, "replace", side_effect=OSError("disk full")
+                ):
+                    with self.assertRaises(OSError):
+                        shadow_wrapper.save_state(
+                            {
+                                "alpha": shadow_wrapper.HostState(
+                                    declined=False,
+                                    last_checked="2026-08-18T19:00:00+00:00",
+                                    was_accessible=True,
+                                )
+                            }
+                        )
+                self.assertEqual(shadow_wrapper.load_state(), previous)
+            self.assertEqual(
+                sorted(path.name for path in Path(directory).iterdir()),
+                ["state.json"],
+            )
+
 
 class HostDialogStateMachineTest(unittest.TestCase):
     """Model-based tests for the per-host dialog/decision state machine.
@@ -480,6 +517,125 @@ class ShadowIntegrationTest(unittest.TestCase):
         result = self.run_shadow("scp", "source", destination)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"scp args=source {destination}\n")
+
+
+class NetworkDialogIntegrationTest(ShadowIntegrationTest):
+    """Dialog flows through the real entry point, with fake probe and UI.
+
+    The fake ``ssh`` fails connectivity probes (they carry BatchMode=yes) and
+    otherwise prints its arguments; the fake ``osascript`` logs each dialog
+    and answers from ``DIALOG_ANSWER``.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        ssh = self.real_bin / "ssh"
+        ssh.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            '  if [ "$arg" = "BatchMode=yes" ]; then\n'
+            '    if [ "${PROBE_OK:-}" = "1" ]; then exit 0; fi\n'
+            "    exit 1\n"
+            "  fi\n"
+            "done\n"
+            "printf 'ssh args=%s\\n' \"$*\"\n"
+        )
+        self.dialog_log = self.tmp / "dialog.log"
+        osascript = self.real_bin / "osascript"
+        osascript.write_text(
+            "#!/bin/sh\n"
+            f"printf 'dialog\\n' >> \"{self.dialog_log}\"\n"
+            'if [ "${DIALOG_ANSWER:-yes}" = "no" ]; then\n'
+            "  printf 'button returned:No\\n'\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf 'button returned:Yes\\n'\n"
+            "exit 0\n"
+        )
+        osascript.chmod(0o755)
+        self.environment.pop("PROBE_OK", None)
+        self.environment["DIALOG_ANSWER"] = "yes"
+
+    def state_document(self) -> dict:
+        state_file = self.tmp / ".cache" / "agent-command-guards" / "state.json"
+        return json.loads(state_file.read_text())
+
+    def dialogs_shown(self) -> int:
+        if not self.dialog_log.exists():
+            return 0
+        return len(self.dialog_log.read_text().splitlines())
+
+    def test_unreachable_host_with_yes_proceeds_and_records(self) -> None:
+        result = self.run_shadow("ssh", "beta", "true")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ssh args=beta true\n")
+        self.assertEqual(self.dialogs_shown(), 1)
+        beta = self.state_document()["beta"]
+        self.assertFalse(beta["declined"])
+        self.assertFalse(beta["was_accessible"])
+        self.assertTrue(beta["last_checked"])
+
+    def test_unreachable_host_with_no_aborts_and_is_remembered(self) -> None:
+        self.environment["DIALOG_ANSWER"] = "no"
+
+        result = self.run_shadow("ssh", "beta", "true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("ssh args=", result.stdout)
+        self.assertIn("not accessible", result.stderr)
+        self.assertEqual(self.dialogs_shown(), 1)
+        self.assertTrue(self.state_document()["beta"]["declined"])
+
+        # The remembered decline fails fast: no second dialog, no real ssh.
+        result = self.run_shadow("ssh", "beta", "true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.dialogs_shown(), 1)
+
+    def test_successful_probe_skips_dialog_and_clears_decline(self) -> None:
+        self.environment["DIALOG_ANSWER"] = "no"
+        self.assertEqual(self.run_shadow("ssh", "beta", "true").returncode, 1)
+        self.assertTrue(self.state_document()["beta"]["declined"])
+
+        self.environment["PROBE_OK"] = "1"
+        result = self.run_shadow("ssh", "beta", "true")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ssh args=beta true\n")
+        self.assertEqual(self.dialogs_shown(), 1)
+        beta = self.state_document()["beta"]
+        self.assertFalse(beta["declined"])
+        self.assertTrue(beta["was_accessible"])
+
+    def test_concurrent_dialogs_serialize_state_writes(self) -> None:
+        # Several agents hit the same unreachable host at once; the flock and
+        # atomic rename must leave one valid document, not interleaved JSON.
+        processes = [
+            subprocess.Popen(
+                [str(self.guard_bin / "ssh"), "beta", "true"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.environment,
+                text=True,
+            )
+            for _ in range(6)
+        ]
+        outcomes = [process.communicate() for process in processes]
+
+        for process, (stdout, _) in zip(processes, outcomes, strict=True):
+            self.assertEqual(process.returncode, 0, stdout)
+            self.assertEqual(stdout, "ssh args=beta true\n")
+        self.assertEqual(self.dialogs_shown(), 6)
+        document = self.state_document()
+        self.assertEqual(
+            sorted(document),
+            ["beta"],
+        )
+        self.assertFalse(document["beta"]["declined"])
+        state_dir = self.tmp / ".cache" / "agent-command-guards"
+        self.assertEqual(
+            sorted(path.name for path in state_dir.iterdir()),
+            ["state.json", "state.lock"],
+        )
 
 
 if __name__ == "__main__":

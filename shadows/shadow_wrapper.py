@@ -157,10 +157,22 @@ def load_state() -> dict[str, HostState]:
 
 
 def save_state(state: dict[str, HostState]) -> None:
-    """Save state to file."""
+    """Save state to file.
+
+    Written to a sibling temporary file and renamed into place, so a crash
+    mid-write cannot replace the previous decisions with a truncated document.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with STATE_FILE.open("w") as f:
+    temp_file = STATE_DIR / (STATE_FILE.name + ".tmp")
+    with temp_file.open("w") as f:
         json.dump({host: asdict(s) for host, s in state.items()}, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.replace(temp_file, STATE_FILE)
+    except OSError:
+        temp_file.unlink(missing_ok=True)
+        raise
 
 
 def find_real_binary(name: str) -> str:
