@@ -32,6 +32,10 @@ find_real_binary() {
 
 REAL_GIT="$(find_real_binary git "$SCRIPT_PATH")"
 
+# Branch name this shadow points HEAD at, relative to refs/heads/. Local
+# plumbing, never to be pushed; the local/ prefix says so wherever it surfaces.
+SHADOW_HEAD_REF="local/jj-shadow-head"
+
 GIT_SEARCH_DIR="$PWD"
 SUBCMD=""
 SUBCMD_INDEX=0
@@ -139,14 +143,43 @@ jj_export_with_retry() {
 
 # Point git HEAD at the jj working copy parent (@-) so that git commands
 # like "git diff HEAD" work against the backing store.
-# Mirrors the jj alias git-symlink-head from ~/.jjconfig.toml.
+# Mirrors the jj alias git-symlink-head from ~/.config/jj/config.toml.
+#
+# The ref has to live under refs/heads/ even though it is local plumbing:
+# pointing HEAD outside that namespace makes `git branch` fail outright with
+# "HEAD not found below refs/heads!", and branch is one of the subcommands this
+# shadow exists to serve. The local/ prefix is what marks it as machine-owned.
+#
+# Returns 0 when HEAD names the shadow ref, born or unborn; 1 when this
+# invocation should fall through to the real git unchanged.
 sync_git_head() {
     local git_dir="$1"
     local jj_root="$2"
     local commit_id
     commit_id="$(jj -R "$jj_root" log -r @- --no-graph -T commit_id 2>/dev/null)" || return 1
-    "$REAL_GIT" --git-dir="$git_dir" update-ref refs/heads/jj-head "$commit_id" 2>/dev/null || return 1
-    "$REAL_GIT" --git-dir="$git_dir" symbolic-ref HEAD refs/heads/jj-head 2>/dev/null || return 1
+    if [[ "$commit_id" =~ ^0+$ ]]; then
+        # @- is the virtual root: there is no parent commit to point at, and
+        # git update-ref reads the all-zero OID as "delete this ref" and exits
+        # 0, so the ref is never created. A pure repo can still use an unborn
+        # HEAD at the shadow ref -- status reports "No commits yet" against an
+        # empty index. A co-located repo has a live .git whose HEAD already
+        # serves the user's fresh checkout, so leave it alone.
+        if [[ -e "$jj_root/.git" ]]; then
+            return 1
+        fi
+    elif [[ -z "$commit_id" ]]; then
+        return 1
+    else
+        "$REAL_GIT" --git-dir="$git_dir" update-ref refs/heads/"$SHADOW_HEAD_REF" "$commit_id" 2>/dev/null || return 1
+    fi
+    "$REAL_GIT" --git-dir="$git_dir" symbolic-ref HEAD refs/heads/"$SHADOW_HEAD_REF" 2>/dev/null || return 1
+    # Repositories served before the ref was renamed carry the old spelling as
+    # a machine-owned branch, which jj imports as a bookmark named jj-head --
+    # one that carries no local/ marker and would happily be pushed. Now that
+    # the new ref is in place, retire the old one.
+    if "$REAL_GIT" --git-dir="$git_dir" show-ref --verify --quiet refs/heads/jj-head 2>/dev/null; then
+        "$REAL_GIT" --git-dir="$git_dir" update-ref -d refs/heads/jj-head 2>/dev/null || true
+    fi
 }
 
 # A pure jj Git store is bare and has no index. Build a private index from the
@@ -154,7 +187,14 @@ sync_git_head() {
 prepare_pure_git_index() {
     local git_dir="$1"
     export GIT_INDEX_FILE="$git_dir/agent-command-guards.index"
-    "$REAL_GIT" --git-dir="$git_dir" read-tree HEAD 2>/dev/null
+    if "$REAL_GIT" --git-dir="$git_dir" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        "$REAL_GIT" --git-dir="$git_dir" read-tree HEAD 2>/dev/null
+    else
+        # Unborn HEAD (a repo with no parent commit yet) compares against an
+        # empty index; read-tree itself fails on it. Clear any stale index so
+        # the empty comparison base is what Git sees.
+        rm -f -- "$GIT_INDEX_FILE"
+    fi
 }
 
 # For read-oriented commands and branch inspection, export jj state, point Git

@@ -157,7 +157,7 @@ directory it prints a reminder to use `jj`, and for several subcommands it does
 more than remind.
 
 Read-oriented commands and branch inspection get real jj state: the wrapper runs
-`jj git export` and points Git's `HEAD` at a synthetic `jj-head` branch tracking
+`jj git export` and points Git's `HEAD` at a synthetic `local/jj-shadow-head` branch tracking
 the jj working-copy parent, so `git log` and `git status` describe the repository
 as jj sees it rather than a stale export.
 
