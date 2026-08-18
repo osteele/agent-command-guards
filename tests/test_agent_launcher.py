@@ -108,6 +108,14 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"zdotdir={SHELL_INIT}", result.stdout)
 
+    def test_codex_gets_the_zsh_bridge(self) -> None:
+        # codex re-sources shell configuration for its shell tool the same way
+        # opencode does, so it needs the bridge as well.
+        self.install_real("codex")
+        result = self.launch("codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"zdotdir={SHELL_INIT}", result.stdout)
+
     def session_id(self, result: subprocess.CompletedProcess[str]) -> str:
         for line in result.stdout.splitlines():
             if line.startswith("agent_session="):
@@ -168,6 +176,25 @@ class AgentLauncherTest(unittest.TestCase):
 
 
 class ShellBridgeTest(unittest.TestCase):
+    def run_bridge_zshenv(self, home: Path) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["AGENT_COMMAND_GUARDS_DIR"] = str(SHADOWS)
+        environment["AGENT_LAUNCHER_ORIGINAL_ZDOTDIR"] = str(home)
+        environment["ZDOTDIR"] = str(SHELL_INIT)
+        environment["HOME"] = str(home)
+        environment["TERM"] = "dumb"
+        return subprocess.run(
+            # -f skips this machine's startup files; the bridge file under
+            # test is then sourced explicitly, exactly as zsh would.
+            ["/bin/zsh", "-f", "-c", 'source "$ZDOTDIR/.zshenv"; echo $PATH; echo zdotdir=$ZDOTDIR'],
+            capture_output=True,
+            check=False,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+
     def test_startup_files_restore_the_shadow_directory(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             home = Path(name)
@@ -195,6 +222,35 @@ class ShellBridgeTest(unittest.TestCase):
         self.assertTrue(
             result.stdout.strip().startswith(f"{SHADOWS}:"),
             f"shadow directory is not first: {result.stdout.strip()[:200]}",
+        )
+
+    def test_user_zshenv_repointing_zdotdir_does_not_break_the_bridge(self) -> None:
+        # Frameworks and version managers repoint ZDOTDIR from .zshenv; the
+        # bridge must still find its own prepend script afterwards instead of
+        # erroring against the replacement directory. Clobbering every helper
+        # variable the bridge might use must not matter either, so the test
+        # trashes them all.
+        with tempfile.TemporaryDirectory() as name:
+            home = Path(name)
+            (
+                home / ".zshenv"
+            ).write_text(
+                f'export ZDOTDIR="{home}"\n'
+                "bridge_dir=garbage\n"
+                "original_zdotdir=garbage\n"
+                "unset bridge_dir original_zdotdir\n"
+            )
+            result = self.run_bridge_zshenv(home)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("no such file", result.stderr.lower())
+        # The repoint actually happened, so the hazard was exercised...
+        self.assertIn(f"zdotdir={home}", result.stdout)
+        # ...and the shadows are still at the front of PATH.
+        first_path_line = result.stdout.splitlines()[0]
+        self.assertTrue(
+            first_path_line.startswith(f"{SHADOWS}:"),
+            f"shadow directory is not first: {first_path_line[:200]}",
         )
 
 

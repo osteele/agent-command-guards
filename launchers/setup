@@ -56,7 +56,15 @@ remove_block() {
     # repository, and in-place sed refuses to edit anything but a regular file.
     local target
     target="$(realpath "$file")"
-    sed -i '' "/$BLOCK_START/,/$BLOCK_END/d" "$target"
+    if $DRY_RUN; then
+        printf 'Would remove managed block from %s\n' "$target"
+        return 0
+    fi
+    # Edit through a sibling temporary file: `sed -i ''` is BSD-only syntax,
+    # and GNU sed would read the empty suffix as the script.
+    local temporary="${target}.agent-launchers.tmp"
+    sed "/$BLOCK_START/,/$BLOCK_END/d" "$target" > "$temporary"
+    mv "$temporary" "$target"
     printf 'Removed managed block from %s\n' "$target"
 }
 
@@ -137,19 +145,26 @@ agent_guards_restore() {
         *) unset guards_dir; return 0 ;;
     esac
 
-    guards_updated="\$guards_dir"
-    guards_saved_ifs="\$IFS"
-    IFS=':'
-    for guards_entry in \$PATH; do
+    # Walk PATH with parameter expansion rather than word splitting: zsh does
+    # not split unquoted variables, and these rc files run under zsh as well
+    # as sh and bash.
+    guards_rest="\$guards_dir"
+    guards_rem="\$PATH"
+    while [ -n "\$guards_rem" ]; do
+        guards_entry="\${guards_rem%%:*}"
+        if [ "\$guards_rem" = "\$guards_entry" ]; then
+            guards_rem=""
+        else
+            guards_rem="\${guards_rem#*:}"
+        fi
         if [ -n "\$guards_entry" ] && [ "\$guards_entry" != "\$guards_dir" ]; then
-            guards_updated="\$guards_updated:\$guards_entry"
+            guards_rest="\$guards_rest:\$guards_entry"
         fi
     done
-    IFS="\$guards_saved_ifs"
 
-    PATH="\$guards_updated"
+    PATH="\$guards_rest"
     export PATH
-    unset guards_dir guards_updated guards_entry guards_saved_ifs
+    unset guards_dir guards_rest guards_rem guards_entry
 }
 agent_guards_restore
 unset -f agent_guards_restore
