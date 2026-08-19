@@ -248,6 +248,23 @@ class RamGuardIntegrationTest(unittest.TestCase):
         terminate_child.assert_called_once_with(child, 4242, 0, 137)
 
     @requires_posix_processes
+    def test_escalation_kill_tolerates_a_recycled_process_group(self) -> None:
+        # On a loaded host the guarded group can exit and have its id recycled
+        # between the liveness probe and the escalation kill; EPERM then names
+        # a group that is no longer ours and must not crash the guard.
+        sent: list[int] = []
+
+        def killpg(_pgid: int, sig: int) -> None:
+            sent.append(sig)
+            if sig == signal.SIGKILL:
+                raise PermissionError(1, "Operation not permitted")
+
+        with mock.patch.object(ram_guard.os, "killpg", side_effect=killpg):
+            ram_guard.terminate_process_group(4242, 0)
+
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+
+    @requires_posix_processes
     def test_passes_normal_command_and_mps_defaults(self) -> None:
         code = (
             "import json,os; print(json.dumps({"

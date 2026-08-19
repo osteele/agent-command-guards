@@ -264,7 +264,9 @@ def terminate_process_group(process_group: int, grace_seconds: float) -> None:
             # process-existence probes. The initial SIGTERM has still been sent.
             return
         time.sleep(0.05)
-    with contextlib.suppress(ProcessLookupError):
+    # The group can exit and have its id recycled between the probe above and
+    # this escalation shot; EPERM then names a group that is no longer ours.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(process_group, signal.SIGKILL)
 
 
@@ -332,9 +334,12 @@ def run_guarded(
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process_group, signum)
 
+    forwarded_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        forwarded_signals.append(signal.SIGHUP)
     previous_handlers = {
         signum: signal.signal(signum, forward_signal)
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        for signum in forwarded_signals
     }
     try:
         while True:
