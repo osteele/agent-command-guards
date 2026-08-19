@@ -16,7 +16,12 @@ AGENTS = ("kimi", "opencode", "codex")
 RC_FILES = (".zshenv", ".zshrc", ".bashrc")
 BLOCK_START = "# >>> agent-launchers initialize >>>"
 
+requires_posix = unittest.skipIf(
+    os.name == "nt", "setup and the generated env file are POSIX shell"
+)
 
+
+@requires_posix
 class LauncherSetupTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -140,6 +145,7 @@ class LauncherSetupTest(unittest.TestCase):
         self.assertFalse((self.home / ".config").exists())
 
 
+@requires_posix
 class GeneratedEnvTest(unittest.TestCase):
     """The generated env file must restore the guards in sh, Bash, and Zsh."""
 

@@ -26,7 +26,12 @@ REPORT_ENVIRONMENT = (
     'printf \'codex_thread=%s\\n\' "${CODEX_THREAD_ID:-}"\n'
 )
 
+requires_posix = unittest.skipIf(
+    os.name == "nt", "the launcher and its Zsh bridge are POSIX shell scripts"
+)
 
+
+@requires_posix
 class AgentLauncherTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -175,6 +180,7 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn("args=wrapper install", result.stdout)
 
 
+@requires_posix
 class ShellBridgeTest(unittest.TestCase):
     def run_bridge_zshenv(self, home: Path) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)

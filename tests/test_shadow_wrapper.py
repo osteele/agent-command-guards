@@ -26,6 +26,11 @@ shadow_wrapper = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = shadow_wrapper
 spec.loader.exec_module(shadow_wrapper)
 
+requires_posix_shell = unittest.skipIf(
+    os.name == "nt",
+    "executable shell-script fakes and which(1) need a POSIX system",
+)
+
 
 class ManagedHostParsingTest(unittest.TestCase):
     def test_generated_managed_host_variants_are_guarded(self) -> None:
@@ -478,6 +483,7 @@ class HostDialogStateMachineTest(unittest.TestCase):
                                     )
 
 
+@requires_posix_shell
 class ShadowIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -519,6 +525,7 @@ class ShadowIntegrationTest(unittest.TestCase):
         self.assertEqual(result.stdout, f"scp args=source {destination}\n")
 
 
+@requires_posix_shell
 class NetworkDialogIntegrationTest(ShadowIntegrationTest):
     """Dialog flows through the real entry point, with fake probe and UI.
 

@@ -13,6 +13,7 @@ SHADOWS = Path(__file__).resolve().parent.parent / "shadows"
 GIT_SHADOW = SHADOWS / "git"
 
 
+@unittest.skipIf(os.name == "nt", "the git shadow is a bash wrapper")
 class GitShadowIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         jj = shutil.which("jj")

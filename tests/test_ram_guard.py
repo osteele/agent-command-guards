@@ -27,6 +27,14 @@ ram_guard = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ram_guard
 spec.loader.exec_module(ram_guard)
 
+requires_posix_processes = unittest.skipIf(
+    os.name == "nt",
+    "ram-guard's process groups and memory monitors are POSIX-only",
+)
+requires_posix_shell = unittest.skipIf(
+    os.name == "nt", "executable shell-script fakes need a POSIX system"
+)
+
 
 class SizeParsingTest(unittest.TestCase):
     def test_binary_sizes(self) -> None:
@@ -239,6 +247,7 @@ class RamGuardIntegrationTest(unittest.TestCase):
         self.assertEqual(result, 137)
         terminate_child.assert_called_once_with(child, 4242, 0, 137)
 
+    @requires_posix_processes
     def test_passes_normal_command_and_mps_defaults(self) -> None:
         code = (
             "import json,os; print(json.dumps({"
@@ -258,6 +267,7 @@ class RamGuardIntegrationTest(unittest.TestCase):
             {"active": "1", "high": "0.7", "low": "0.6"},
         )
 
+    @requires_posix_processes
     def test_terminates_process_tree_above_limit(self) -> None:
         try:
             ram_guard.process_rows()
@@ -305,6 +315,7 @@ class RamGuardIntegrationTest(unittest.TestCase):
             result.stderr,
         )
 
+    @requires_posix_processes
     def test_sigterm_to_the_guard_reaches_the_child_group(self) -> None:
         # An agent session that cancels a guarded run signals the guard, not
         # the child; the guard must forward to the child's process group and
@@ -363,6 +374,7 @@ class RamGuardIntegrationTest(unittest.TestCase):
             os.kill(child_pid, 0)
 
 
+@requires_posix_shell
 class UvShadowIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
