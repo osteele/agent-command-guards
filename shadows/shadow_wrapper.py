@@ -13,7 +13,6 @@ Usage:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
@@ -24,6 +23,26 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+if os.name == "nt":
+    # fcntl does not exist on Windows; lock the same file through the CRT so
+    # concurrent writers still serialize there.
+    import msvcrt
+
+    def acquire_lock(lock_fd: int) -> None:
+        msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
+
+    def release_lock(lock_fd: int) -> None:
+        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def acquire_lock(lock_fd: int) -> None:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    def release_lock(lock_fd: int) -> None:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 # Managed hosts that require network checks
 TARGET_HOSTS = {"alpha", "beta", "gamma"}
@@ -129,10 +148,10 @@ def state_lock():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        acquire_lock(lock_fd)
         yield
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        release_lock(lock_fd)
         os.close(lock_fd)
 
 
