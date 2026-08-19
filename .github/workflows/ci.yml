@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.14"]
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # ShellBridgeTest drives /bin/zsh; macOS and Windows ship it (or need
+      # nothing), Linux runners do not.
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q zsh
+
+      # The git-shadow tests drive a real jj. Asset names embed the release
+      # version, so match by glob against the latest release instead of
+      # pinning a URL.
+      - name: Install jj (non-Windows)
+        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$(uname -sm)" in
+            "Darwin arm64")  pattern="jj-*-aarch64-apple-darwin.*" ;;
+            "Darwin x86_64") pattern="jj-*-x86_64-apple-darwin.*" ;;
+            "Linux x86_64")  pattern="jj-*-x86_64-unknown-linux-*" ;;
+            "Linux aarch64") pattern="jj-*-aarch64-unknown-linux-*" ;;
+            *) echo "unsupported platform: $(uname -sm)" >&2; exit 1 ;;
+          esac
+          dist="$HOME/jj-dist"
+          mkdir -p "$dist"
+          (cd "$dist" && gh release download --repo jj-vcs/jj --pattern "$pattern" --clobber)
+          for archive in "$dist"/*; do
+            case "$archive" in
+              *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dist" ;;
+              *.zip) unzip -qo "$archive" -d "$dist" ;;
+              *) echo "unrecognized asset: $archive" >&2; exit 1 ;;
+            esac
+          done
+          jj_bin="$(dirname "$(find "$dist" -type f -name jj | head -n 1)")"
+          echo "$jj_bin" >> "$GITHUB_PATH"
+          "$jj_bin/jj" --version
+
+      - name: Syntax-check shell wrappers (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          bash -n agent-launcher launchers/setup shadows/git
+          zsh -n launchers/shell-init/.zshenv launchers/shell-init/.zshrc \
+                 launchers/shell-init/.zprofile launchers/shell-init/.zlogin
+
+      - name: Run the suite
+        run: python -m unittest -v

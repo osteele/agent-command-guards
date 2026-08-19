@@ -1,5 +1,7 @@
 # Agent Command Guards
 
+[![CI](https://github.com/osteele/agent-command-guards/actions/workflows/ci.yml/badge.svg)](https://github.com/osteele/agent-command-guards/actions/workflows/ci.yml)
+
 Wrappers for `ssh`, `scp`, `rsync`, `git`, and `uv` that apply workstation policy
 to the commands an agent runs. Each wrapper does its work and hands off to the
 real binary, so a guarded command behaves like the unguarded one everywhere the
@@ -229,3 +231,9 @@ python3 -m unittest          # from the repository root
 The suite uses `unittest`. It drives the real wrappers as subprocesses against
 temporary repositories and fake binaries, so it exercises the files that agents
 actually run.
+
+CI runs it on Linux, macOS, and Windows across Python 3.10–3.14. Windows runs
+the portable suites (parsers, state, size parsing, mocked monitors); suites that
+need POSIX shells, `which(1)`, process groups, or memory monitors skip there
+with their reason. Linux and macOS jobs install `jj` from its latest release so
+the git-shadow tests run against a real repository backend.
