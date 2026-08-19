@@ -207,6 +207,18 @@ if [[ "$SUBCMD" =~ ^(show|diff|log|status|branch)$ ]]; then
                     # Co-located: real git sees the work tree normally.
                     exec "$REAL_GIT" "$@"
                 else
+                    # A pure store carries no work-tree excludes, so git
+                    # status would list jj's own plumbing (`.jj/`) as untracked
+                    # content on any machine whose global gitignore does not
+                    # happen to hide it. Point this one invocation at a
+                    # shadow-owned excludes file; this overrides an on-disk
+                    # core.excludesFile for the delegated command only.
+                    exclude_file="$git_dir/agent-command-guards.exclude"
+                    [[ -f "$exclude_file" ]] || printf '.jj/\n' > "$exclude_file"
+                    exclude_slot="${GIT_CONFIG_COUNT:-0}"
+                    export "GIT_CONFIG_KEY_$exclude_slot=core.excludesFile"
+                    export "GIT_CONFIG_VALUE_$exclude_slot=$exclude_file"
+                    export GIT_CONFIG_COUNT="$((exclude_slot + 1))"
                     # Pure jj uses a bare Git store, so provide its work tree.
                     if [[ "$SUBCMD" == "log" ]] && ! "$REAL_GIT" --git-dir="$git_dir" rev-parse HEAD &>/dev/null; then
                         exec "$REAL_GIT" --git-dir="$git_dir" "$SUBCMD" --branches "${SUBCMD_ARGS[@]}"

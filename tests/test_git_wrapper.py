@@ -78,6 +78,24 @@ class GitShadowIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, " M tracked.txt\n")
 
+    def test_pure_jj_status_hides_jj_plumbing_without_global_ignores(self) -> None:
+        # Fresh jj repositories ship no excludes for their own `.jj` directory;
+        # a machine whose global gitignore does not hide it must still get
+        # clean porcelain from the shadow, which supplies its own excludes.
+        environment = dict(self.environment)
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        (self.repo / "tracked.txt").write_text("modified\n")
+        result = subprocess.run(
+            [str(GIT_SHADOW), "status", "--short"],
+            capture_output=True,
+            check=False,
+            cwd=self.repo,
+            env=environment,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, " M tracked.txt\n")
+
     def test_colocated_jj_status_preserves_git_porcelain(self) -> None:
         colocated = self.tmp / "colocated"
         self.run_jj("git", "init", "--colocate", str(colocated), cwd=self.tmp)
