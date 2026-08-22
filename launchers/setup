@@ -18,6 +18,7 @@ ENV_FILE="$CONFIG_DIR/env"
 BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
 BLOCK_START="# >>> agent-launchers initialize >>>"
 BLOCK_END="# <<< agent-launchers initialize <<<"
+BLOCK_SOLUTION='Agent launchers are not configured; run ~/code/agent-tools/agent-command-guards/launchers/setup'
 AGENTS=(kimi opencode codex)
 
 DRY_RUN=false
@@ -72,17 +73,28 @@ add_block() {
     local file="$1"
     [[ -f "$file" ]] || return 0
     if grep -qF "$BLOCK_START" "$file"; then
-        printf 'Already configured: %s\n' "$file"
-        return 0
+        if grep -qF "$BLOCK_SOLUTION" "$file"; then
+            printf 'Already configured: %s\n' "$file"
+            return 0
+        fi
+        if $DRY_RUN; then
+            printf 'Would update managed block in %s\n' "$file"
+            return 0
+        fi
+        remove_block "$file"
     fi
     if $DRY_RUN; then
         printf 'Would add managed block to %s\n' "$file"
         return 0
     fi
-    printf '\n%s\n%s\n%s\n%s\n' \
+    printf '\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$BLOCK_START" \
         '# !! Contents within this block are managed by agent-command-guards/launchers/setup !!' \
-        ". \"\$HOME/.config/agent-launchers/env\"" \
+        'if [ -f "$HOME/.config/agent-launchers/env" ]; then' \
+        '    . "$HOME/.config/agent-launchers/env"' \
+        'else' \
+        "    printf '%s\\n' '$BLOCK_SOLUTION' >&2" \
+        'fi' \
         "$BLOCK_END" >> "$file"
     printf 'Configured: %s\n' "$file"
 }

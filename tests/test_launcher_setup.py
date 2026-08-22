@@ -15,6 +15,11 @@ SHADOWS = REPO / "shadows"
 AGENTS = ("kimi", "opencode", "codex")
 RC_FILES = (".zshenv", ".zshrc", ".bashrc")
 BLOCK_START = "# >>> agent-launchers initialize >>>"
+BLOCK_END = "# <<< agent-launchers initialize <<<"
+BLOCK_SOLUTION = (
+    "Agent launchers are not configured; run "
+    "~/code/agent-tools/agent-command-guards/launchers/setup"
+)
 
 requires_posix = unittest.skipIf(
     os.name == "nt", "setup and the generated env file are POSIX shell"
@@ -79,8 +84,10 @@ class LauncherSetupTest(unittest.TestCase):
         for name in RC_FILES:
             content = (self.home / name).read_text()
             self.assertEqual(content.count(BLOCK_START), 1, name)
+            self.assertEqual(content.count(BLOCK_END), 1, name)
             self.assertIn(self.sentinel(name), content)
             self.assertIn('. "$HOME/.config/agent-launchers/env"', content)
+            self.assertIn(BLOCK_SOLUTION, content)
 
     def test_install_leaves_missing_rc_files_uncreated(self) -> None:
         (self.home / ".zshenv").write_text(f"{self.sentinel('.zshenv')}\n")
@@ -101,6 +108,28 @@ class LauncherSetupTest(unittest.TestCase):
         self.assertEqual(second.stdout.count("Already linked"), 3)
         for name in RC_FILES:
             self.assertEqual((self.home / name).read_text().count(BLOCK_START), 1)
+            self.assertEqual((self.home / name).read_text().count(BLOCK_END), 1)
+
+    def test_install_upgrades_an_existing_source_only_block(self) -> None:
+        self.seed_rc_files()
+        for name in RC_FILES:
+            with (self.home / name).open("a") as file:
+                file.write(
+                    f"\n{BLOCK_START}\n"
+                    '# !! Contents within this block are managed by '
+                    'agent-command-guards/launchers/setup !!\n'
+                    '. "$HOME/.config/agent-launchers/env"\n'
+                    f'{BLOCK_END}\n'
+                )
+
+        result = self.run_setup()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in RC_FILES:
+            content = (self.home / name).read_text()
+            self.assertEqual(content.count(BLOCK_START), 1, name)
+            self.assertEqual(content.count(BLOCK_END), 1, name)
+            self.assertIn(BLOCK_SOLUTION, content)
 
     def test_install_refuses_to_replace_a_foreign_binary(self) -> None:
         self.bin_dir.mkdir(parents=True)
