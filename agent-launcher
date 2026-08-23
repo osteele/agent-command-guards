@@ -196,6 +196,14 @@ REAL_BINARY="$(find_real_binary)"
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
 AGENT_SESSION_ID="$(new_session_id)"
 export AGENT_SESSION_ID
+# Names the process this id was minted for. `exec` below replaces this shell,
+# so $$ is the agent's own pid. Unsetting above protects an agent this launcher
+# starts; the marker protects consumers of an agent started WITHOUT it, which
+# inherits our AGENT_SESSION_ID from the environment and is otherwise
+# indistinguishable from having been minted its own. A consumer that knows its
+# host agent's pid rejects an id whose marker names a different process.
+AGENT_SESSION_PID=$$
+export AGENT_SESSION_PID
 
 if [[ -x "$SHADOW_DIR/git" ]]; then
     prepend_path_once "$SHADOW_DIR"
