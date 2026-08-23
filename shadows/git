@@ -95,6 +95,14 @@ else
     SUBCMD_ARGS=()
 fi
 
+warn_about_jj_compatibility() {
+    local command="git"
+    if [[ -n "$SUBCMD" ]]; then
+        command+=" $SUBCMD"
+    fi
+    printf 'Warning: that this repo is managed by jujutsu. `%s` is supported through a compatibility layer, but `git` commands in general are not supported; please use `jj` instead.\n' "$command" >&2
+}
+
 # Walk up from Git's effective working directory looking for a .jj directory.
 find_jj_root() {
     if $EXPLICIT_GIT_REPOSITORY; then return 1; fi
@@ -203,6 +211,7 @@ if [[ "$SUBCMD" =~ ^(show|diff|log|status|branch)$ ]]; then
     if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
         if jj_export_with_retry "$jj_root"; then
             if git_dir="$(get_jj_git_dir "$jj_root")" && sync_git_head "$git_dir" "$jj_root"; then
+                warn_about_jj_compatibility
                 if [[ -e "$jj_root/.git" ]]; then
                     # Co-located: real git sees the work tree normally.
                     exec "$REAL_GIT" "$@"
@@ -432,7 +441,7 @@ maybe_warn_about_jj() {
     fi
 
     if [[ -e "$root/.git" && -e "$root/.jj" ]]; then
-        echo "Note that this project uses jujutsu" >&2
+        warn_about_jj_compatibility
     fi
 }
 

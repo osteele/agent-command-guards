@@ -66,6 +66,35 @@ class GitShadowIntegrationTest(unittest.TestCase):
         result = self.run_shadow("--no-pager", "status")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("On branch local/jj-shadow-head", result.stdout)
+        self.assertEqual(
+            result.stderr,
+            "Warning: that this repo is managed by jujutsu. `git status` is "
+            "supported through a compatibility layer, but `git` commands in general "
+            "are not supported; please use `jj` instead.\n",
+        )
+
+    def test_compatibility_warning_names_log_subcommand(self) -> None:
+        result = self.run_shadow("log", "--oneline")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Warning: that this repo is managed by jujutsu. `git log` is supported ",
+            result.stderr,
+        )
+
+    def test_fallback_warning_names_delegated_subcommand(self) -> None:
+        colocated = self.tmp / "colocated-warning"
+        self.run_jj("git", "init", "--colocate", str(colocated), cwd=self.tmp)
+
+        result = self.run_shadow("rev-parse", "--show-toplevel", cwd=colocated)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Warning: that this repo is managed by jujutsu. `git rev-parse` is "
+            "supported through a compatibility layer",
+            result.stderr,
+        )
+        self.assertNotIn("Note that this project uses jujutsu", result.stderr)
 
     def test_dash_c_finds_jj_repository(self) -> None:
         result = self.run_shadow("-C", str(self.repo), "status", cwd=self.tmp)
