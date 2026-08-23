@@ -125,7 +125,7 @@ doctor() {
         printf 'WARN Git shadow: %s/git is missing or not executable\n' "$SHADOW_DIR"
     fi
 
-    if [[ -x "$SHADOW_DIR/uv" && -x "$SHADOW_DIR/ram-guard" ]]; then
+    if [[ -x "$SHADOW_DIR/uv" && -x "$SHADOW_DIR/with-limits" ]]; then
         printf 'OK   UV RAM guard: %s\n' "$SHADOW_DIR/uv"
     else
         printf 'WARN UV RAM guard is incomplete under %s\n' "$SHADOW_DIR"

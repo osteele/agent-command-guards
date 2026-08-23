@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-GUARD = HERE / "ram-guard"
+GUARD = HERE / "with-limits"
 BYPASS_VALUES = {"0", "false", "no", "off"}
 GLOBAL_OPTIONS_WITH_VALUES = {
     "--allow-insecure-host",

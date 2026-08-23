@@ -10,7 +10,7 @@ policy has nothing to say.
 Policy applies at the executable boundary, which catches a command however it was
 composed. Provider selection, agent permissions, and tool-request policy belong to
 the launchers and to [agent-tool-policy](https://github.com/osteele/agent-tool-policy), the shared pre-tool
-hook that also calls `ram-guard` here by absolute path.
+hook that also calls `with-limits` here by absolute path.
 
 ## Layout
 
@@ -169,11 +169,21 @@ refuses to touch the primary workspace, the current one, a symlink, or a path th
 is merely similar. A workspace holding changes or untracked files survives unless
 `-f` is supplied.
 
-### uv and ram-guard
+### uv and with-limits
 
 The `uv` shadow passes ordinary uv subcommands through unchanged. It runs `uv run`
-under `ram-guard`, which watches the resident memory of the whole process tree and
+under `with-limits`, which watches the resident memory of the whole process tree and
 terminates only its own process group on reaching the limit.
+
+`with-limits` accepts either an argument-vector command after `--` or a shell command
+with `-c` (short for `-- /bin/zsh -c`):
+
+```bash
+with-limits -- uv run python experiment.py
+with-limits -c 'just format && uv run python -m unittest && just check'
+```
+
+The former `ram-guard` name remains as a compatibility alias.
 
 The default ceiling is 70% of the memory the host reports as available at launch.
 The remaining 30%, plus everything already in use by the rest of the system, stays
@@ -207,7 +217,7 @@ process inspection is permitted, and falls back to an available-memory floor in
 sandboxes that block it.
 
 The shared pre-tool hook in agent-tool-policy wraps `uv run` a second way, by
-rewriting the command to an absolute `ram-guard` path. That covers absolute uv
+rewriting the command to an absolute `with-limits` path. That covers absolute uv
 paths and `mise`/`command` prefixes, which never consult `PATH` and so never reach
 this shadow.
 
@@ -219,7 +229,7 @@ Each wrapper has to locate the command it shadows without re-executing itself.
 has to skip mise shims: a shim ahead of the concrete `uv` binary hangs or recurses
 when this shadow comes earlier on `PATH`.
 
-Handoff uses `exec`, which preserves exit codes and signal behavior. `ram-guard`
+Handoff uses `exec`, which preserves exit codes and signal behavior. `with-limits`
 is the deliberate exception, staying resident to monitor its child.
 
 ## Tests

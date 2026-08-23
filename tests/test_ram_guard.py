@@ -16,20 +16,21 @@ from pathlib import Path
 from unittest import mock
 
 SHADOWS = Path(__file__).resolve().parent.parent / "shadows"
-GUARD = SHADOWS / "ram-guard"
+GUARD = SHADOWS / "with-limits"
+LEGACY_GUARD = SHADOWS / "ram-guard"
 UV_SHADOW = SHADOWS / "uv"
 
-loader = importlib.machinery.SourceFileLoader("ram_guard", str(GUARD))
+loader = importlib.machinery.SourceFileLoader("with_limits", str(GUARD))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 if spec is None or spec.loader is None:
-    raise RuntimeError("could not load ram-guard")
+    raise RuntimeError("could not load with-limits")
 ram_guard = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = ram_guard
 spec.loader.exec_module(ram_guard)
 
 requires_posix_processes = unittest.skipIf(
     os.name == "nt",
-    "ram-guard's process groups and memory monitors are POSIX-only",
+    "with-limits process groups and memory monitors are POSIX-only",
 )
 requires_posix_shell = unittest.skipIf(
     os.name == "nt", "executable shell-script fakes need a POSIX system"
@@ -48,6 +49,20 @@ class SizeParsingTest(unittest.TestCase):
                 self.assertRaises(ram_guard.argparse.ArgumentTypeError),
             ):
                 ram_guard.parse_size(value)
+
+
+class ArgumentParsingTest(unittest.TestCase):
+    def test_shell_command_expands_to_zsh(self) -> None:
+        args = ram_guard.parse_args(["-c", "just format && just check"])
+
+        self.assertEqual(
+            args.command,
+            ["/bin/zsh", "-c", "just format && just check"],
+        )
+
+    def test_shell_command_and_explicit_command_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit):
+            ram_guard.parse_args(["-c", "just format", "--", "just", "check"])
 
 
 class AvailableMemoryTest(unittest.TestCase):
@@ -125,6 +140,22 @@ class CeilingAnnouncementTest(unittest.TestCase):
 
 
 class RamGuardIntegrationTest(unittest.TestCase):
+    @requires_posix_shell
+    def test_legacy_name_resolves_to_canonical_executable(self) -> None:
+        self.assertEqual(LEGACY_GUARD.resolve(), GUARD.resolve())
+
+    @unittest.skipUnless(Path("/bin/zsh").exists(), "/bin/zsh is unavailable")
+    def test_shell_command_shorthand(self) -> None:
+        result = subprocess.run(
+            [str(GUARD), "--limit", "128M", "-c", "printf shorthand"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "shorthand")
+
     def test_process_inspection_isolated_from_unrelated_memory_use(self) -> None:
         child = mock.Mock(pid=4242)
         child.poll.return_value = 0
