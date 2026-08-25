@@ -158,10 +158,11 @@ A Bash wrapper for projects that use both Git and
 directory it prints a reminder to use `jj`, and for several subcommands it does
 more than remind.
 
-Read-oriented commands and branch inspection get real jj state: the wrapper runs
-`jj git export` and points Git's `HEAD` at a synthetic `local/jj-shadow-head` branch tracking
-the jj working-copy parent, so `git log` and `git status` describe the repository
-as jj sees it rather than a stale export.
+Read-oriented commands and branch inspection get real jj state: the wrapper
+first asks jj to snapshot and synchronize the co-located working copy. jj keeps
+Git's `HEAD` detached at the working-copy parent, so `git log` and `git status`
+describe the repository as jj sees it rather than stale Git state, without
+creating a synthetic jj bookmark.
 
 `git worktree` add, list, remove, and prune map to the corresponding `jj
 workspace` operations. Removal resolves the exact registered workspace path and
