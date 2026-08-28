@@ -217,4 +217,9 @@ if [[ -x "$SHADOW_DIR/git" ]]; then
     fi
 fi
 
-exec "$REAL_BINARY" "$@"
+# Reduced CPU priority for the agent and everything it spawns (children
+# inherit niceness). `nice` only arbitrates contention: on idle cores the agent
+# runs at full speed, and under load the user's interactive work wins. `nice`
+# execs the target in place, so $$ and AGENT_SESSION_PID still name the agent.
+NICENESS="${AGENT_LAUNCHER_NICE:-5}"
+exec nice -n "$NICENESS" "$REAL_BINARY" "$@"

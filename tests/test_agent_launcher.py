@@ -16,14 +16,15 @@ SHELL_INIT = LAUNCHER_DIR / "shell-init"
 
 REPORT_ENVIRONMENT = (
     "#!/bin/sh\n"
-    'printf \'args=%s\\n\' "$*"\n'
-    'printf \'guards=%s\\n\' "${AGENT_COMMAND_GUARDS_ACTIVE:-}"\n'
-    'printf \'guards_dir=%s\\n\' "${AGENT_COMMAND_GUARDS_DIR:-}"\n'
-    'printf \'zdotdir=%s\\n\' "${ZDOTDIR:-}"\n'
-    'printf \'first_on_path=%s\\n\' "$(command -v uv)"\n'
-    'printf \'agent_session=%s\\n\' "${AGENT_SESSION_ID:-}"\n'
-    'printf \'claude_session=%s\\n\' "${CLAUDE_CODE_SESSION_ID:-}"\n'
-    'printf \'codex_thread=%s\\n\' "${CODEX_THREAD_ID:-}"\n'
+    "printf 'args=%s\\n' \"$*\"\n"
+    "printf 'guards=%s\\n' \"${AGENT_COMMAND_GUARDS_ACTIVE:-}\"\n"
+    "printf 'guards_dir=%s\\n' \"${AGENT_COMMAND_GUARDS_DIR:-}\"\n"
+    "printf 'zdotdir=%s\\n' \"${ZDOTDIR:-}\"\n"
+    "printf 'first_on_path=%s\\n' \"$(command -v uv)\"\n"
+    "printf 'agent_session=%s\\n' \"${AGENT_SESSION_ID:-}\"\n"
+    "printf 'claude_session=%s\\n' \"${CLAUDE_CODE_SESSION_ID:-}\"\n"
+    "printf 'codex_thread=%s\\n' \"${CODEX_THREAD_ID:-}\"\n"
+    "printf 'niceness=%s\\n' \"$(ps -o nice= -p $$ | tr -d ' ')\"\n"
 )
 
 requires_posix = unittest.skipIf(
@@ -96,6 +97,19 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn("guards=1", result.stdout)
         self.assertIn(f"guards_dir={SHADOWS}", result.stdout)
         self.assertIn(f"first_on_path={SHADOWS / 'uv'}", result.stdout)
+
+    def test_launches_agent_at_reduced_priority(self) -> None:
+        self.install_real("kimi")
+        result = self.launch("kimi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("niceness=5", result.stdout)
+
+    def test_niceness_is_overridable_and_zero_disables(self) -> None:
+        self.install_real("kimi")
+        self.environment["AGENT_LAUNCHER_NICE"] = "0"
+        result = self.launch("kimi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("niceness=0", result.stdout)
 
     def test_kimi_does_not_get_the_zsh_bridge(self) -> None:
         # kimi runs tool commands through `sh -c`, which never reads zsh
@@ -192,7 +206,12 @@ class ShellBridgeTest(unittest.TestCase):
         return subprocess.run(
             # -f skips this machine's startup files; the bridge file under
             # test is then sourced explicitly, exactly as zsh would.
-            ["/bin/zsh", "-f", "-c", 'source "$ZDOTDIR/.zshenv"; echo $PATH; echo zdotdir=$ZDOTDIR'],
+            [
+                "/bin/zsh",
+                "-f",
+                "-c",
+                'source "$ZDOTDIR/.zshenv"; echo $PATH; echo zdotdir=$ZDOTDIR',
+            ],
             capture_output=True,
             check=False,
             env=environment,
@@ -238,9 +257,7 @@ class ShellBridgeTest(unittest.TestCase):
         # trashes them all.
         with tempfile.TemporaryDirectory() as name:
             home = Path(name)
-            (
-                home / ".zshenv"
-            ).write_text(
+            (home / ".zshenv").write_text(
                 f'export ZDOTDIR="{home}"\n'
                 "bridge_dir=garbage\n"
                 "original_zdotdir=garbage\n"

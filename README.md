@@ -83,6 +83,14 @@ Adding another agent takes a symlink in `launchers/` plus, if its installer puts
 the binary somewhere a login shell would not find, an entry in the launcher's
 `fallback_candidates`.
 
+### CPU priority
+
+The launcher starts the agent under `nice -n 5`, which the agent's whole process
+tree inherits. Niceness only arbitrates contention — an otherwise-idle machine
+runs the agent at full speed — so delegated work yields to interactive use and
+costs nothing the rest of the time. Set `AGENT_LAUNCHER_NICE` to change the
+value (`0` disables).
+
 ### Session identity
 
 The launcher exports `AGENT_SESSION_ID`, a fresh id per launch, and unsets
