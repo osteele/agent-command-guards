@@ -36,6 +36,9 @@ GIT_SEARCH_DIR="$PWD"
 SUBCMD=""
 SUBCMD_INDEX=0
 EXPLICIT_GIT_REPOSITORY=false
+EXPLICIT_GIT_DIR="${GIT_DIR:-}"
+EXPLICIT_WORK_TREE="${GIT_WORK_TREE:-}"
+EXPLICIT_BARE=false
 if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ]]; then
     EXPLICIT_GIT_REPOSITORY=true
 fi
@@ -67,11 +70,32 @@ parse_git_invocation() {
             -c|--config-env|--namespace)
                 index=$((index + 1))
                 ;;
-            --git-dir|--work-tree)
+            --git-dir)
                 EXPLICIT_GIT_REPOSITORY=true
                 index=$((index + 1))
+                if (( index < ${#arguments[@]} )); then
+                    EXPLICIT_GIT_DIR="${arguments[$index]}"
+                fi
                 ;;
-            --git-dir=*|--work-tree=*|--bare) EXPLICIT_GIT_REPOSITORY=true ;;
+            --work-tree)
+                EXPLICIT_GIT_REPOSITORY=true
+                index=$((index + 1))
+                if (( index < ${#arguments[@]} )); then
+                    EXPLICIT_WORK_TREE="${arguments[$index]}"
+                fi
+                ;;
+            --git-dir=*)
+                EXPLICIT_GIT_REPOSITORY=true
+                EXPLICIT_GIT_DIR="${arg#*=}"
+                ;;
+            --work-tree=*)
+                EXPLICIT_GIT_REPOSITORY=true
+                EXPLICIT_WORK_TREE="${arg#*=}"
+                ;;
+            --bare)
+                EXPLICIT_GIT_REPOSITORY=true
+                EXPLICIT_BARE=true
+                ;;
             -c?*|--config-env=*|--namespace=*) ;;
             -*) ;;
             *)
@@ -96,12 +120,11 @@ warn_about_jj_compatibility() {
     if [[ -n "$SUBCMD" ]]; then
         command+=" $SUBCMD"
     fi
-    printf 'Warning: that this repo is managed by jujutsu. `%s` is supported through a compatibility layer, but `git` commands in general are not supported; please use `jj` instead.\n' "$command" >&2
+    printf 'Warning: this repo is managed by jujutsu. `%s` is supported through a compatibility layer, but `git` commands in general are not supported; please use `jj` instead.\n' "$command" >&2
 }
 
 # Walk up from Git's effective working directory looking for a .jj directory.
 find_jj_root() {
-    if $EXPLICIT_GIT_REPOSITORY; then return 1; fi
     local dir="${1:-$PWD}"
     dir="$(cd -- "$dir" 2>/dev/null && pwd -P)" || return 1
     while true; do
@@ -115,6 +138,97 @@ find_jj_root() {
         dir="$(dirname "$dir")"
     done
     return 1
+}
+
+resolve_explicit_git_path() {
+    local path="$1"
+    local candidate
+    if [[ "$path" == /* ]]; then
+        candidate="$path"
+    else
+        candidate="$GIT_SEARCH_DIR/$path"
+    fi
+    # Python's non-strict realpath resolves symlinks and `..` through the
+    # nearest existing ancestor while preserving leaves that Git may create.
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$candidate"
+}
+
+find_jj_root_from_explicit_path() {
+    local path="$1"
+    local resolved root
+    resolved="$(resolve_explicit_git_path "$path")" || return 1
+    while [[ ! -d "$resolved" ]]; do
+        if [[ "$resolved" == "/" ]]; then return 1; fi
+        resolved="$(dirname "$resolved")"
+    done
+    root="$(find_jj_root "$resolved" 2>/dev/null)" || return 1
+    if [[ -e "$root/.git" ]]; then
+        echo "$root"
+        return 0
+    fi
+    return 1
+}
+
+find_invocation_jj_root() {
+    local root
+    if [[ -n "$EXPLICIT_WORK_TREE" ]] && root="$(find_jj_root_from_explicit_path \
+        "$EXPLICIT_WORK_TREE")"; then
+        echo "$root"
+        return 0
+    fi
+    if [[ -n "$EXPLICIT_GIT_DIR" ]] && root="$(find_jj_root_from_explicit_path \
+        "$EXPLICIT_GIT_DIR")"; then
+        echo "$root"
+        return 0
+    fi
+    root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)" || return 1
+    if [[ -e "$root/.git" ]]; then
+        echo "$root"
+        return 0
+    fi
+    return 1
+}
+
+path_is_within() {
+    local path="$1"
+    local root="$2"
+    [[ "$path" == "$root" || "$path" == "$root/"* ]]
+}
+
+# An explicit repository bypasses the jj guard only when its Git directory and
+# working tree are both known to be outside the surrounding jj repository.
+# A lone external --git-dir is not enough: Git may still use the current jj
+# working tree. Bare repositories have no working tree, so the Git directory is
+# sufficient in that case.
+explicit_repository_is_outside_jj() {
+    local jj_root="$1"
+    local resolved_jj_root resolved_git_dir resolved_work_tree
+
+    if ! $EXPLICIT_GIT_REPOSITORY || [[ -z "$EXPLICIT_GIT_DIR" ]]; then
+        return 1
+    fi
+    resolved_jj_root="$(realpath "$jj_root" 2>/dev/null)" || return 1
+    resolved_git_dir="$(resolve_explicit_git_path "$EXPLICIT_GIT_DIR")" || return 1
+    if path_is_within "$resolved_git_dir" "$resolved_jj_root"; then
+        return 1
+    fi
+    if $EXPLICIT_BARE; then
+        return 0
+    fi
+    if [[ -z "$EXPLICIT_WORK_TREE" ]]; then
+        return 1
+    fi
+    resolved_work_tree="$(resolve_explicit_git_path "$EXPLICIT_WORK_TREE")" || return 1
+    ! path_is_within "$resolved_work_tree" "$resolved_jj_root"
+}
+
+find_guarded_jj_root() {
+    local root
+    root="$(find_invocation_jj_root)" || return 1
+    if explicit_repository_is_outside_jj "$root"; then
+        return 1
+    fi
+    echo "$root"
 }
 
 get_jj_git_dir() {
@@ -146,29 +260,74 @@ retire_shadow_bookmarks() {
     done
 }
 
-# For read-oriented commands and branch inspection, run a jj command to
-# snapshot the shared working copy and synchronize Git's HEAD and index, then
-# delegate to real Git. This compatibility path is only for co-located repos.
-if [[ "$SUBCMD" =~ ^(show|diff|log|status|branch)$ ]]; then
-    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
-        if [[ -e "$jj_root/.git" ]] && sync_jj_working_copy "$jj_root" && retire_shadow_bookmarks "$jj_root"; then
-            warn_about_jj_compatibility
-            exec "$REAL_GIT" "$@"
-        fi
-        # Fall through if synchronization failed
-    fi
-fi
+branch_is_read_only() {
+    local list_patterns=false arg
+    while (( $# > 0 )); do
+        arg="$1"
+        shift
+        case "$arg" in
+            --list)
+                list_patterns=true
+                ;;
+            -a|-r|-v|-vv|--all|--ignore-case|--no-abbrev|--no-color|--no-column|--omit-empty|--remotes|--show-current|--verbose)
+                ;;
+            --abbrev|--color|--column|--contains|--format|--merged|--no-contains|--no-merged|--points-at|--sort)
+                # These options accept a separate value, but some also have a
+                # useful value-less form. Consume a value only when present.
+                if (( $# > 0 )) && [[ "$1" != -* ]]; then shift; fi
+                ;;
+            --abbrev=*|--color=*|--column=*|--contains=*|--format=*|--merged=*|--no-contains=*|--no-merged=*|--points-at=*|--sort=*)
+                ;;
+            --)
+                $list_patterns || return 1
+                return 0
+                ;;
+            -[arv]*)
+                [[ "${arg:1}" =~ ^[arv]+$ ]] || return 1
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                $list_patterns || return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+is_allowlisted_read_command() {
+    case "$SUBCMD" in
+        ""|annotate|blame|cat-file|check-attr|check-ignore|check-mailmap|diff|diff-files|diff-index|diff-tree|for-each-ref|grep|log|ls-files|ls-tree|merge-base|name-rev|range-diff|rev-list|rev-parse|shortlog|show|show-ref|status|version|whatchanged)
+            return 0
+            ;;
+        branch)
+            branch_is_read_only "${SUBCMD_ARGS[@]}"
+            return
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+deny_unsupported_git_command() {
+    local command="git"
+    if [[ -n "$SUBCMD" ]]; then command+=" $SUBCMD"; fi
+    printf 'git shadow: refusing unsupported `%s` in a jj repository; only explicitly allowlisted Git compatibility commands may run. Use `jj` instead.\n' "$command" >&2
+    exit 1
+}
 
 # In jj repos, git add is a no-op (jj auto-tracks via snapshot.auto-track).
 if [[ "$SUBCMD" == "add" ]]; then
-    if find_jj_root "$GIT_SEARCH_DIR" &>/dev/null; then
+    if find_guarded_jj_root &>/dev/null; then
         exit 0
     fi
 fi
 
 # In jj repos, translate git commit to jj commit / jj describe.
 if [[ "$SUBCMD" == "commit" ]]; then
-    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
+    if jj_root="$(find_guarded_jj_root)"; then
         local_args=()
         amend=false
         for arg in "${SUBCMD_ARGS[@]}"; do
@@ -333,32 +492,33 @@ handle_worktree() {
             exec jj -R "$jj_root" workspace update-stale
             ;;
         *)
-            echo "git shadow: 'git worktree $worktree_subcmd' not mapped in jj repos; falling through to real git" >&2
             return 1
             ;;
     esac
 }
 
 if [[ "$SUBCMD" == "worktree" ]]; then
-    if jj_root="$(find_jj_root "$GIT_SEARCH_DIR" 2>/dev/null)"; then
+    if jj_root="$(find_guarded_jj_root)"; then
         if handle_worktree "$jj_root" "${SUBCMD_ARGS[@]}"; then
             true  # handled via exec/exit inside handle_worktree
         fi
-        # Unknown worktree subcmd falls through to real git below
     fi
 fi
 
-# For all other commands, warn if jj is present and delegate.
-maybe_warn_about_jj() {
-    local root
-    if ! root="$("$REAL_GIT" rev-parse --show-toplevel 2>/dev/null)"; then
-        return
-    fi
-
-    if [[ -e "$root/.git" && -e "$root/.jj" ]]; then
+# In a co-located jj repository, delegate only commands whose behavior is
+# explicitly classified as read-only. Synchronize jj's shared working copy
+# first so even safe Git queries do not observe stale HEAD or index state.
+if jj_root="$(find_guarded_jj_root)"; then
+    if is_allowlisted_read_command; then
+        if ! sync_jj_working_copy "$jj_root" || ! retire_shadow_bookmarks "$jj_root"; then
+            echo "git shadow: could not synchronize the jj working copy before running Git" >&2
+            exit 1
+        fi
         warn_about_jj_compatibility
+        exec "$REAL_GIT" "$@"
     fi
-}
+    deny_unsupported_git_command
+fi
 
-maybe_warn_about_jj
+# Outside co-located jj repositories, preserve normal Git behavior.
 exec "$REAL_GIT" "$@"

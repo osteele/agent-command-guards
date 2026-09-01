@@ -51,14 +51,17 @@ class GitShadowIntegrationTest(unittest.TestCase):
         return result
 
     def run_shadow(
-        self, *args: str, cwd: Path | None = None
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(GIT_SHADOW), *args],
             capture_output=True,
             check=False,
             cwd=cwd or self.repo,
-            env=self.environment,
+            env=env if env is not None else self.environment,
             text=True,
         )
 
@@ -68,7 +71,7 @@ class GitShadowIntegrationTest(unittest.TestCase):
         self.assertIn("Not currently on any branch", result.stdout)
         self.assertEqual(
             result.stderr,
-            "Warning: that this repo is managed by jujutsu. `git status` is "
+            "Warning: this repo is managed by jujutsu. `git status` is "
             "supported through a compatibility layer, but `git` commands in general "
             "are not supported; please use `jj` instead.\n",
         )
@@ -78,7 +81,7 @@ class GitShadowIntegrationTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "Warning: that this repo is managed by jujutsu. `git log` is supported ",
+            "Warning: this repo is managed by jujutsu. `git log` is supported ",
             result.stderr,
         )
 
@@ -90,11 +93,133 @@ class GitShadowIntegrationTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "Warning: that this repo is managed by jujutsu. `git rev-parse` is "
+            "Warning: this repo is managed by jujutsu. `git rev-parse` is "
             "supported through a compatibility layer",
             result.stderr,
         )
         self.assertNotIn("Note that this project uses jujutsu", result.stderr)
+
+    def test_checkout_is_denied_without_discarding_working_copy_change(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("uncommitted refactor\n")
+
+        result = self.run_shadow("checkout", "--", "tracked.txt")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(tracked.read_text(), "uncommitted refactor\n")
+        self.assertIn("refusing unsupported `git checkout`", result.stderr)
+
+    def test_explicit_git_dir_does_not_bypass_checkout_denial(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("uncommitted refactor\n")
+
+        result = self.run_shadow("--git-dir=.git", "checkout", "--", "tracked.txt")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(tracked.read_text(), "uncommitted refactor\n")
+        self.assertIn("refusing unsupported `git checkout`", result.stderr)
+
+    def test_git_directory_environment_does_not_bypass_checkout_denial(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("uncommitted refactor\n")
+        environment = {
+            **self.environment,
+            "GIT_DIR": str(self.repo / ".git"),
+            "GIT_WORK_TREE": str(self.repo),
+        }
+
+        result = self.run_shadow(
+            "checkout", "--", "tracked.txt", cwd=self.tmp, env=environment
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(tracked.read_text(), "uncommitted refactor\n")
+        self.assertIn("refusing unsupported `git checkout`", result.stderr)
+
+    def test_dash_c_rebases_explicit_paths_back_into_jj_repository(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("uncommitted refactor\n")
+        subdir = self.repo / "subdir"
+        subdir.mkdir()
+
+        result = self.run_shadow(
+            "--git-dir=../.git",
+            "--work-tree=..",
+            "-C",
+            str(subdir),
+            "checkout",
+            "--",
+            "tracked.txt",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(tracked.read_text(), "uncommitted refactor\n")
+        self.assertIn("refusing unsupported `git checkout`", result.stderr)
+
+    def test_explicit_external_repository_bypasses_jj_denial(self) -> None:
+        plain = self.tmp / "plain"
+        plain.mkdir()
+
+        init_result = self.run_shadow(
+            f"--git-dir={plain / '.git'}",
+            f"--work-tree={plain}",
+            "init",
+        )
+        self.assertEqual(init_result.returncode, 0, init_result.stderr)
+        self.assertTrue((plain / ".git").is_dir())
+
+        result = self.run_shadow(
+            f"--git-dir={plain / '.git'}",
+            f"--work-tree={plain}",
+            "checkout",
+            "--orphan",
+            "topic",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("refusing unsupported", result.stderr)
+
+    def test_mutating_branch_command_is_denied(self) -> None:
+        result = self.run_shadow("branch", "topic")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing unsupported `git branch`", result.stderr)
+
+    def test_read_only_branch_command_is_allowlisted(self) -> None:
+        result = self.run_shadow("branch", "--show-current")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("supported through a compatibility layer", result.stderr)
+
+    def test_branch_list_pattern_named_like_mutating_option_is_allowlisted(
+        self,
+    ) -> None:
+        result = self.run_shadow("branch", "--list", "--", "--delete")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("supported through a compatibility layer", result.stderr)
+
+    def test_unknown_worktree_command_is_denied(self) -> None:
+        result = self.run_shadow("worktree", "lock", str(self.repo))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing unsupported `git worktree`", result.stderr)
+
+    def test_explicit_git_dir_preserves_worktree_list_translation(self) -> None:
+        result = self.run_shadow("--git-dir=.git", "worktree", "list")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("default:", result.stdout)
+        self.assertNotIn("refusing unsupported", result.stderr)
+
+    def test_commands_outside_jj_repositories_still_delegate(self) -> None:
+        plain_git_repo = self.tmp / "plain-git"
+        plain_git_repo.mkdir()
+
+        result = self.run_shadow("init", cwd=plain_git_repo)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((plain_git_repo / ".git").is_dir())
 
     def test_dash_c_finds_jj_repository(self) -> None:
         result = self.run_shadow("-C", str(self.repo), "status", cwd=self.tmp)

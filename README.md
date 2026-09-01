@@ -162,15 +162,19 @@ State lives in `~/.cache/agent-command-guards/state.json`, written under
 ### git
 
 A Bash wrapper for projects that use both Git and
-[Jujutsu](https://github.com/martinvonz/jj). In a repository with a `.jj`
-directory it prints a reminder to use `jj`, and for several subcommands it does
-more than remind.
+[Jujutsu](https://github.com/martinvonz/jj). In a co-located repository it uses
+an explicit compatibility whitelist: known read-only Git commands and the
+translations below are supported, while every unclassified Git command is
+refused with a reminder to use `jj`. Commands outside jj repositories continue
+to use Git normally.
 
-Read-oriented commands and branch inspection get real jj state: the wrapper
-first asks jj to snapshot and synchronize the co-located working copy. jj keeps
-Git's `HEAD` detached at the working-copy parent, so `git log` and `git status`
-describe the repository as jj sees it rather than stale Git state, without
-creating a synthetic jj bookmark.
+Allowlisted read-oriented commands and read-only branch inspection get real jj
+state: the wrapper first asks jj to snapshot and synchronize the co-located
+working copy. jj keeps Git's `HEAD` detached at the working-copy parent, so
+`git log` and `git status` describe the repository as jj sees it rather than
+stale Git state, without creating a synthetic jj bookmark. Mutating branch
+forms and commands such as `git checkout`, `git reset`, and `git clean` are
+refused instead of falling through to Git.
 
 `git worktree` add, list, remove, and prune map to the corresponding `jj
 workspace` operations. Removal resolves the exact registered workspace path and
