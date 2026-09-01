@@ -33,7 +33,7 @@ Each agent gets there through its own launcher:
 | Agent | Launcher |
 | --- | --- |
 | Claude Code | `claude-wrapper`, via its `prepend_path` setting |
-| Codex, kimi, opencode | `agent-launcher` in this repository (see below) |
+| Codex, kimi, opencode, OMP | `agent-launcher` in this repository (see below) |
 
 Confirm inside a session that the guards win the lookup:
 
@@ -67,7 +67,7 @@ that agent needs the Zsh bridge; the rest is shared.
 ./launchers/setup --uninstall
 ```
 
-Setup links `~/bin/kimi`, `~/bin/opencode`, and `~/bin/codex` to the launchers,
+Setup links `~/bin/kimi`, `~/bin/opencode`, `~/bin/codex`, and `~/bin/omp` to the launchers,
 and adds a managed block to `~/.zshenv`, `~/.zshrc`, and `~/.bashrc` that prepends
 `launchers/` to `PATH` and restores the guards to the front of it. That
 subdirectory holds only the launchers, so making it globally visible does not make
@@ -77,6 +77,7 @@ the command shadows globally visible. Verify with:
 kimi wrapper doctor
 opencode wrapper doctor
 codex wrapper doctor
+omp wrapper doctor
 ```
 
 Adding another agent takes a symlink in `launchers/` plus, if its installer puts
@@ -97,9 +98,10 @@ The launcher exports `AGENT_SESSION_ID`, a fresh id per launch, and unsets
 `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID` first.
 
 Claude Code and Codex export a per-session id into their shell subprocesses. Kimi
-and opencode export none, so a tool that needs to tell two sessions in one
-directory apart has nothing to go on. Addressing agent-mail to one session rather
-than broadcasting to the whole project is the case that motivated this.
+and opencode export none. OMP exposes its native conversation id to extensions,
+but not to MCP or tool subprocesses, so its push bridge, tools, and Weft jobs
+otherwise acquire different identities. Addressing agent-mail to one session
+rather than broadcasting to the whole project is the case that motivated this.
 `AGENT_SESSION_ID` fills the gap.
 
 The unset handles nesting. An agent started from inside another agent's shell

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Install the agent launchers (kimi, opencode, codex) ahead of their real binaries.
+# Install the agent launchers (kimi, opencode, codex, omp) ahead of their real binaries.
 #
 # The launchers live in this directory rather than the repository root so that
 # putting them on PATH does not also put the command shadows there. Only the
@@ -19,7 +19,7 @@ BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
 BLOCK_START="# >>> agent-launchers initialize >>>"
 BLOCK_END="# <<< agent-launchers initialize <<<"
 BLOCK_SOLUTION='Agent launchers are not configured; run ~/code/agent-tools/agent-command-guards/launchers/setup'
-AGENTS=(kimi opencode codex)
+AGENTS=(kimi opencode codex omp)
 
 DRY_RUN=false
 UNINSTALL=false
@@ -211,5 +211,5 @@ add_block "$HOME/.bashrc"
 
 if ! $DRY_RUN; then
     printf 'Setup complete. Restart the shell or run: . %s\n' "$ENV_FILE"
-    printf 'Then verify with: kimi wrapper doctor && opencode wrapper doctor\n'
+    printf 'Then verify with: kimi wrapper doctor && opencode wrapper doctor && omp wrapper doctor\n'
 fi

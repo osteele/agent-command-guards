@@ -22,6 +22,8 @@ REPORT_ENVIRONMENT = (
     "printf 'zdotdir=%s\\n' \"${ZDOTDIR:-}\"\n"
     "printf 'first_on_path=%s\\n' \"$(command -v uv)\"\n"
     "printf 'agent_session=%s\\n' \"${AGENT_SESSION_ID:-}\"\n"
+    "printf 'agent_session_pid=%s\\n' \"${AGENT_SESSION_PID:-}\"\n"
+    "printf 'process_pid=%s\\n' \"$$\"\n"
     "printf 'claude_session=%s\\n' \"${CLAUDE_CODE_SESSION_ID:-}\"\n"
     "printf 'codex_thread=%s\\n' \"${CODEX_THREAD_ID:-}\"\n"
     "printf 'niceness=%s\\n' \"$(ps -o nice= -p $$ | tr -d ' ')\"\n"
@@ -102,14 +104,16 @@ class AgentLauncherTest(unittest.TestCase):
         self.install_real("kimi")
         result = self.launch("kimi")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("niceness=5", result.stdout)
+        expected = min(19, os.getpriority(os.PRIO_PROCESS, 0) + 5)
+        self.assertIn(f"niceness={expected}", result.stdout)
 
     def test_niceness_is_overridable_and_zero_disables(self) -> None:
         self.install_real("kimi")
         self.environment["AGENT_LAUNCHER_NICE"] = "0"
         result = self.launch("kimi")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("niceness=0", result.stdout)
+        expected = os.getpriority(os.PRIO_PROCESS, 0)
+        self.assertIn(f"niceness={expected}", result.stdout)
 
     def test_kimi_does_not_get_the_zsh_bridge(self) -> None:
         # kimi runs tool commands through `sh -c`, which never reads zsh
@@ -149,6 +153,14 @@ class AgentLauncherTest(unittest.TestCase):
         result = self.launch("kimi")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(self.session_id(result), "")
+
+    def test_omp_shares_one_launcher_identity_with_its_subprocesses(self) -> None:
+        self.install_real("omp")
+        result = self.launch("omp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.session_id(result), "")
+        lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(lines["agent_session_pid"], lines["process_pid"])
 
     def test_each_launch_gets_a_distinct_session_id(self) -> None:
         self.install_real("kimi")

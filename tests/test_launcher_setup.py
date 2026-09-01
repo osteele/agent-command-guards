@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parent.parent
 LAUNCHER_DIR = REPO / "launchers"
 SETUP = LAUNCHER_DIR / "setup"
 SHADOWS = REPO / "shadows"
-AGENTS = ("kimi", "opencode", "codex")
+AGENTS = ("kimi", "opencode", "codex", "omp")
 RC_FILES = (".zshenv", ".zshrc", ".bashrc")
 BLOCK_START = "# >>> agent-launchers initialize >>>"
 BLOCK_END = "# <<< agent-launchers initialize <<<"
@@ -105,7 +105,7 @@ class LauncherSetupTest(unittest.TestCase):
         second = self.run_setup()
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(second.stdout.count("Already configured"), 3)
-        self.assertEqual(second.stdout.count("Already linked"), 3)
+        self.assertEqual(second.stdout.count("Already linked"), len(AGENTS))
         for name in RC_FILES:
             self.assertEqual((self.home / name).read_text().count(BLOCK_START), 1)
             self.assertEqual((self.home / name).read_text().count(BLOCK_END), 1)
@@ -116,10 +116,10 @@ class LauncherSetupTest(unittest.TestCase):
             with (self.home / name).open("a") as file:
                 file.write(
                     f"\n{BLOCK_START}\n"
-                    '# !! Contents within this block are managed by '
-                    'agent-command-guards/launchers/setup !!\n'
+                    "# !! Contents within this block are managed by "
+                    "agent-command-guards/launchers/setup !!\n"
                     '. "$HOME/.config/agent-launchers/env"\n'
-                    f'{BLOCK_END}\n'
+                    f"{BLOCK_END}\n"
                 )
 
         result = self.run_setup()

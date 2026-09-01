@@ -2,7 +2,8 @@
 #
 # Generic launcher that activates the command guards for one agent CLI.
 #
-# Invoked through a symlink named for the agent it launches (kimi, opencode).
+# Invoked through a symlink named for the agent it launches (kimi, opencode,
+# codex, omp).
 # The symlink name selects the real binary to find and whether that agent needs
 # the Zsh bridge; everything else is shared.
 
@@ -182,11 +183,12 @@ REAL_BINARY="$(find_real_binary)"
 # Per-session identity, so agent-mail can address one of several sessions
 # sharing a directory instead of broadcasting to all of them.
 #
-# The agents launched here export no per-session id of their own: opencode
+# Some agents launched here export no per-session id of their own: opencode
 # exports only OPENCODE_PID and a per-workspace id, and kimi reads
-# KIMI_SESSION_ID without ever setting it. Without an id minted here, agent-mail
-# falls back to a UUID generated inside its own MCP server, which no sibling
-# subprocess could ever learn -- so such a session cannot be addressed at all.
+# KIMI_SESSION_ID without ever setting it. OMP has a native conversation id,
+# but exposes it only through its extension API rather than to MCP and tool
+# subprocesses. Without an id minted here, sibling components can resolve one
+# logical agent to different addresses.
 #
 # Unset the native ids first, and mint unconditionally. Both are about nesting:
 # an agent launched from inside another agent's shell inherits that parent's
