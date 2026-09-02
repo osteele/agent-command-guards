@@ -131,6 +131,10 @@ for agent in "${AGENTS[@]}"; do
         exit 1
     fi
 done
+if [[ ! -x "$LAUNCHER_DIR/agent-model" ]]; then
+    printf 'Error: %s/agent-model is missing or not executable\n' "$LAUNCHER_DIR" >&2
+    exit 1
+fi
 
 if $DRY_RUN; then
     printf 'Would create %s and prepend %s to PATH\n' "$ENV_FILE" "$LAUNCHER_DIR"

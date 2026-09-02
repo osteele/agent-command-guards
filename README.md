@@ -84,6 +84,61 @@ Adding another agent takes a symlink in `launchers/` plus, if its installer puts
 the binary somewhere a login shell would not find, an entry in the launcher's
 `fallback_candidates`.
 
+### Model-first interactive commands
+
+`launchers/agent-model` lets an interactive shell select a model first and a
+harness second. Source `shell/agent-models.sh` from the interactive shell setup
+to define `claude`, `fable`, `codex`, `kimi`, and `glm` as shell functions. The
+functions are not inherited by subprocesses, so a program that runs `codex
+exec` still reaches the native Codex launcher.
+
+Choose a harness for one invocation with `--harness` or `-h`:
+
+```bash
+codex                         # use the configured default harness
+codex --harness codex         # use Codex itself
+codex -h self                 # same: use this model's native harness
+claude -h omp                 # use OMP with the current Opus selector
+codex -h                      # pass -h through to the selected harness
+```
+
+The short form is consumed only when the next word is a known harness. A bare
+`-h`, or `-h` followed by any other word, remains the selected harness's help
+option. `--harness` reports an unknown value as an error.
+
+Defaults live in
+`${XDG_CONFIG_HOME:-$HOME/.config}/agent-models/config.toml`. A missing file
+uses each model's native harness. The file has a small, checked schema:
+
+```toml
+version = 1
+
+[defaults]
+claude = "claude"
+fable = "claude"
+codex = "omp"
+kimi = "omp"
+glm = "omp"
+```
+
+Use the CLI to inspect or change it without editing the repository:
+
+```bash
+agent-model default list
+agent-model default get codex
+agent-model default set codex omp
+agent-model default reset codex
+agent-model resolve codex -h self
+agent-model config path
+agent-model config check
+agent-model doctor
+```
+
+The native Claude routes resolve `claude` through `PATH`, so an installed
+`claude-wrapper` remains responsible for profiles and command guards. The OMP
+routes use provider-qualified model selectors for Anthropic, Fable, Codex,
+Kimi Code, and the Z.AI coding plan.
+
 ### CPU priority
 
 The launcher starts the agent under `nice -n 5`, which the agent's whole process

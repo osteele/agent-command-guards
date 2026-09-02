@@ -81,6 +81,19 @@ class LauncherSetupTest(unittest.TestCase):
         env_file = self.home / ".config" / "agent-launchers" / "env"
         self.assertTrue(env_file.is_file())
         self.assertIn(f'export PATH="{LAUNCHER_DIR}:$PATH"', env_file.read_text())
+        command = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                f'. "{env_file}"; command -v agent-model',
+            ],
+            capture_output=True,
+            check=False,
+            env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"},
+            text=True,
+        )
+        self.assertEqual(command.returncode, 0, command.stderr)
+        self.assertEqual(command.stdout.strip(), str(LAUNCHER_DIR / "agent-model"))
         for name in RC_FILES:
             content = (self.home / name).read_text()
             self.assertEqual(content.count(BLOCK_START), 1, name)

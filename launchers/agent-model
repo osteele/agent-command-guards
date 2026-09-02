@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Resolve model-first interactive commands to guarded agent harnesses."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+
+MODEL_ORDER = ("claude", "fable", "codex", "kimi", "glm")
+HOME_HARNESSES = {
+    "claude": "claude",
+    "fable": "claude",
+    "codex": "codex",
+    "kimi": "kimi",
+    "glm": "opencode",
+}
+ROUTES = {
+    ("claude", "claude"): ("claude",),
+    ("claude", "omp"): ("omp", "--model=anthropic/claude-opus-5"),
+    ("fable", "claude"): ("claude", "--profile", "fable"),
+    ("fable", "omp"): ("omp", "--model=anthropic/claude-fable-5-1"),
+    ("codex", "codex"): ("codex",),
+    ("codex", "omp"): ("omp", "--model=openai-codex/gpt-5.6-sol"),
+    ("kimi", "kimi"): ("kimi", "-m", "kimi-code/k3"),
+    ("kimi", "omp"): ("omp", "--model=kimi-code/k3"),
+    ("glm", "opencode"): (
+        "opencode",
+        "-m",
+        "zai-coding-plan/glm-5.3-flash",
+    ),
+    ("glm", "omp"): ("omp", "--model=zhipu-coding-plan/glm-5.3"),
+}
+HARNESSES = frozenset(harness for _, harness in ROUTES)
+ASSIGNMENT = re.compile(r"([A-Za-z0-9_-]+)\s*=\s*(.+)")
+
+
+class ConfigError(ValueError):
+    """The user-owned configuration is malformed or unsupported."""
+
+
+def config_path() -> Path:
+    root = os.environ.get("XDG_CONFIG_HOME")
+    config_root = Path(root).expanduser() if root else Path.home() / ".config"
+    return config_root / "agent-models" / "config.toml"
+
+
+def _strip_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in ("'", '"'):
+            quote = None if quote == character else character if quote is None else quote
+            continue
+        if character == "#" and quote is None:
+            return line[:index]
+    return line
+
+
+def _parse_string(raw: str, location: str) -> str:
+    if len(raw) < 2 or raw[0] not in ("'", '"') or raw[-1] != raw[0]:
+        raise ConfigError(f"{location}: expected a quoted string")
+    if raw[0] == "'":
+        value = raw[1:-1]
+        if "'" in value:
+            raise ConfigError(f"{location}: unsupported literal-string quote")
+        return value
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"{location}: invalid quoted string: {error.msg}") from error
+    if not isinstance(value, str):
+        raise ConfigError(f"{location}: expected a string")
+    return value
+
+
+def _canonical_harness(model: str, harness: str, location: str) -> str:
+    if harness == "self":
+        return HOME_HARNESSES[model]
+    if harness not in HARNESSES:
+        expected = ", ".join(sorted(HARNESSES | {"self"}))
+        raise ConfigError(f"{location}: unknown harness {harness!r}; expected {expected}")
+    if (model, harness) not in ROUTES:
+        supported = ", ".join(
+            sorted(route_harness for route_model, route_harness in ROUTES if route_model == model)
+        )
+        raise ConfigError(
+            f"{location}: {model} does not support harness {harness!r}; expected {supported} or self"
+        )
+    return harness
+
+
+def read_config(path: Path | None = None) -> dict[str, str]:
+    selected_path = path or config_path()
+    if not selected_path.exists():
+        return {}
+    try:
+        lines = selected_path.read_text().splitlines()
+    except OSError as error:
+        raise ConfigError(f"{selected_path}: cannot read: {error}") from error
+
+    section: str | None = None
+    version_seen = False
+    defaults: dict[str, str] = {}
+    for line_number, original in enumerate(lines, start=1):
+        line = _strip_comment(original).strip()
+        if not line:
+            continue
+        location = f"{selected_path}:{line_number}"
+        if line.startswith("["):
+            if line != "[defaults]":
+                raise ConfigError(f"{location}: unknown table {line!r}")
+            section = "defaults"
+            continue
+
+        match = ASSIGNMENT.fullmatch(line)
+        if match is None:
+            raise ConfigError(f"{location}: expected key = value")
+        key, raw_value = match.groups()
+        if section is None:
+            if key != "version":
+                raise ConfigError(f"{location}: unknown top-level key {key!r}")
+            if version_seen:
+                raise ConfigError(f"{location}: duplicate version")
+            if raw_value.strip() != "1":
+                raise ConfigError(f"{location}: version must be 1")
+            version_seen = True
+            continue
+
+        if key not in MODEL_ORDER:
+            raise ConfigError(f"{location}: unknown model {key!r}")
+        if key in defaults:
+            raise ConfigError(f"{location}: duplicate default for {key}")
+        harness = _parse_string(raw_value.strip(), location)
+        defaults[key] = _canonical_harness(key, harness, location)
+
+    if not version_seen:
+        raise ConfigError(f"{selected_path}: missing version = 1")
+    return defaults
+
+
+def write_config(defaults: dict[str, str], path: Path | None = None) -> None:
+    selected_path = path or config_path()
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    content = ["version = 1", "", "[defaults]"]
+    content.extend(f'{model} = "{defaults[model]}"' for model in MODEL_ORDER if model in defaults)
+    content.append("")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=selected_path.parent, prefix=".config.toml.", delete=False
+        ) as temporary:
+            temporary.write("\n".join(content))
+            temporary_name = temporary.name
+        os.replace(temporary_name, selected_path)
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def defaults_with_sources() -> dict[str, tuple[str, str]]:
+    configured = read_config()
+    return {
+        model: (
+            configured.get(model, HOME_HARNESSES[model]),
+            "config" if model in configured else "built-in",
+        )
+        for model in MODEL_ORDER
+    }
+
+
+def parse_harness_option(model: str, arguments: list[str]) -> tuple[str | None, list[str]]:
+    if not arguments:
+        return None, arguments
+    first = arguments[0]
+    if first == "--harness":
+        if len(arguments) == 1:
+            raise ConfigError("--harness requires a harness name")
+        return _canonical_harness(model, arguments[1], "--harness"), arguments[2:]
+    if first.startswith("--harness="):
+        harness = first.partition("=")[2]
+        if not harness:
+            raise ConfigError("--harness requires a harness name")
+        return _canonical_harness(model, harness, "--harness"), arguments[1:]
+    if first == "-h" and len(arguments) > 1:
+        candidate = arguments[1]
+        if candidate in HARNESSES or candidate == "self":
+            return _canonical_harness(model, candidate, "-h"), arguments[2:]
+    return None, arguments
+
+
+def resolve(model: str, arguments: list[str]) -> tuple[list[str], str]:
+    if model not in MODEL_ORDER:
+        raise ConfigError(f"unknown model {model!r}; expected {', '.join(MODEL_ORDER)}")
+    explicit, forwarded = parse_harness_option(model, arguments)
+    if explicit is None:
+        harness, _ = defaults_with_sources()[model]
+    else:
+        harness = explicit
+    return [*ROUTES[(model, harness)], *forwarded], harness
+
+
+def print_usage(file: object = sys.stdout) -> None:
+    print(
+        """Usage:
+  agent-model launch MODEL [--harness HARNESS | -h HARNESS] [ARG ...]
+  agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [ARG ...]
+  agent-model default list
+  agent-model default get MODEL
+  agent-model default set MODEL HARNESS
+  agent-model default reset MODEL
+  agent-model config path
+  agent-model config check
+  agent-model doctor
+
+Models: claude, fable, codex, kimi, glm
+Harness alias: self selects the model's native harness.
+
+The harness option is recognized only immediately after MODEL. A bare -h, or
+-h followed by an unknown harness, is forwarded to the selected harness.""",
+        file=file,
+    )
+
+
+def command_default(arguments: list[str]) -> int:
+    if not arguments or arguments[0] == "list":
+        if len(arguments) > 1:
+            raise ConfigError("default list takes no arguments")
+        resolved = defaults_with_sources()
+        print("MODEL   DEFAULT   HOME       SOURCE")
+        for model in MODEL_ORDER:
+            harness, source = resolved[model]
+            print(f"{model:<7} {harness:<9} {HOME_HARNESSES[model]:<10} {source}")
+        return 0
+    action = arguments[0]
+    if action == "get" and len(arguments) == 2:
+        model = arguments[1]
+        if model not in MODEL_ORDER:
+            raise ConfigError(f"unknown model {model!r}")
+        harness, source = defaults_with_sources()[model]
+        print(f"{model} = {harness} ({source})")
+        return 0
+    if action == "set" and len(arguments) == 3:
+        model, requested = arguments[1:]
+        if model not in MODEL_ORDER:
+            raise ConfigError(f"unknown model {model!r}")
+        harness = _canonical_harness(model, requested, "default set")
+        defaults = read_config()
+        defaults[model] = harness
+        write_config(defaults)
+        print(f"{model} = {harness}")
+        return 0
+    if action == "reset" and len(arguments) == 2:
+        model = arguments[1]
+        if model not in MODEL_ORDER:
+            raise ConfigError(f"unknown model {model!r}")
+        defaults = read_config()
+        defaults.pop(model, None)
+        write_config(defaults)
+        print(f"{model} = {HOME_HARNESSES[model]} (built-in)")
+        return 0
+    raise ConfigError("expected default list|get MODEL|set MODEL HARNESS|reset MODEL")
+
+
+def command_config(arguments: list[str]) -> int:
+    if arguments == ["path"]:
+        print(config_path())
+        return 0
+    if arguments == ["check"]:
+        read_config()
+        path = config_path()
+        if path.exists():
+            print(f"OK config: {path}")
+        else:
+            print(f"OK config: absent; using built-in defaults ({path})")
+        return 0
+    raise ConfigError("expected config path or config check")
+
+
+def command_doctor(arguments: list[str]) -> int:
+    if arguments:
+        raise ConfigError("doctor takes no arguments")
+    defaults = defaults_with_sources()
+    print(f"OK config: {config_path() if config_path().exists() else 'absent; built-in defaults'}")
+    failed = False
+    commands = sorted({route[0] for route in ROUTES.values()})
+    for command in commands:
+        location = shutil.which(command)
+        if location is None:
+            print(f"FAIL executable: {command} not found")
+            failed = True
+        else:
+            print(f"OK executable: {command} -> {location}")
+    for model in MODEL_ORDER:
+        harness, source = defaults[model]
+        print(f"OK default: {model} -> {harness} ({source})")
+    return 1 if failed else 0
+
+
+def main(arguments: list[str]) -> int:
+    if not arguments or arguments == ["--help"] or arguments == ["-h"]:
+        print_usage()
+        return 0 if arguments else 2
+    command, rest = arguments[0], arguments[1:]
+    if command in ("launch", "resolve"):
+        if not rest:
+            raise ConfigError(f"{command} requires a model name")
+        invocation, _ = resolve(rest[0], rest[1:])
+        if command == "resolve":
+            print(shlex.join(invocation))
+            return 0
+        try:
+            os.execvp(invocation[0], invocation)
+        except FileNotFoundError as error:
+            raise ConfigError(
+                f"harness executable {invocation[0]!r} was not found on PATH"
+            ) from error
+        raise AssertionError("execvp returned")
+    if command == "default":
+        return command_default(rest)
+    if command == "config":
+        return command_config(rest)
+    if command == "doctor":
+        return command_doctor(rest)
+    raise ConfigError(f"unknown command {command!r}")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except ConfigError as error:
+        print(f"agent-model: {error}", file=sys.stderr)
+        raise SystemExit(2)
