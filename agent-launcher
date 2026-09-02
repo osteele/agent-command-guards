@@ -180,6 +180,14 @@ new_session_id() {
 
 REAL_BINARY="$(find_real_binary)"
 
+# OMP's updater resolves `omp` from PATH to decide which installation it owns.
+# Leave the launcher first for normal sessions, but make the resolved binary's
+# directory win during an update. Otherwise OMP follows launchers/omp to this
+# shared file and replaces the launcher itself with the downloaded OMP binary.
+if [[ "$NAME" == "omp" && "${1:-}" == "update" ]]; then
+    prepend_path_once "$(dirname "$REAL_BINARY")"
+fi
+
 # Per-session identity, so agent-mail can address one of several sessions
 # sharing a directory instead of broadcasting to all of them.
 #

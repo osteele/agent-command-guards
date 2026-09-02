@@ -26,6 +26,7 @@ REPORT_ENVIRONMENT = (
     "printf 'process_pid=%s\\n' \"$$\"\n"
     "printf 'claude_session=%s\\n' \"${CLAUDE_CODE_SESSION_ID:-}\"\n"
     "printf 'codex_thread=%s\\n' \"${CODEX_THREAD_ID:-}\"\n"
+    "printf 'resolved_omp=%s\\n' \"$(command -v omp 2>/dev/null || true)\"\n"
     "printf 'niceness=%s\\n' \"$(ps -o nice= -p $$ | tr -d ' ')\"\n"
 )
 
@@ -161,6 +162,13 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertNotEqual(self.session_id(result), "")
         lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(lines["agent_session_pid"], lines["process_pid"])
+
+    def test_omp_update_exposes_the_real_binary_to_its_updater(self) -> None:
+        real = self.install_real("omp")
+        result = self.launch("omp", "update")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"resolved_omp={real}", result.stdout)
+        self.assertIn(f"first_on_path={SHADOWS / 'uv'}", result.stdout)
 
     def test_each_launch_gets_a_distinct_session_id(self) -> None:
         self.install_real("kimi")
