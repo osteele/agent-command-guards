@@ -70,7 +70,7 @@ class AgentModelTest(unittest.TestCase):
             "fable": "anthropic/claude-fable-5-1",
             "codex": "openai-codex/gpt-5.6-sol",
             "kimi": "kimi-code/k3",
-            "glm": "zhipu-coding-plan/glm-5.3",
+            "glm": "zai/glm-5.3-flash",
         }
         for model in expected:
             set_result = self.run_model("default", "set", model, "omp")
@@ -117,7 +117,7 @@ class AgentModelTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines()[1:],
-            ["--model=zhipu-coding-plan/glm-5.3", "--continue"],
+            ["--model=zai/glm-5.3-flash", "--continue"],
         )
 
     def test_launch_reports_a_missing_harness_executable(self) -> None:

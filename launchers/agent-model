@@ -35,7 +35,7 @@ ROUTES = {
         "-m",
         "zai-coding-plan/glm-5.3-flash",
     ),
-    ("glm", "omp"): ("omp", "--model=zhipu-coding-plan/glm-5.3"),
+    ("glm", "omp"): ("omp", "--model=zai/glm-5.3-flash"),
 }
 HARNESSES = frozenset(harness for _, harness in ROUTES)
 ASSIGNMENT = re.compile(r"([A-Za-z0-9_-]+)\s*=\s*(.+)")
