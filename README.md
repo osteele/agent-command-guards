@@ -164,6 +164,23 @@ inherits that parent's session id, and answering to it would attribute this
 session's work to the parent. Minting unconditionally does the same for an
 inherited `AGENT_SESSION_ID`.
 
+### Anthropic credentials
+
+The launcher unsets `ANTHROPIC_API_KEY` before starting `omp`. Set
+`AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY=1` to keep it.
+
+OMP treats a key it finds in the environment as being logged in: the provider
+list shows Anthropic as `logged in (env)` rather than `(login)`, and requests
+bill at API rates instead of against the subscription. Authorizing the
+subscription afterwards does not displace it, because an environment key leaves
+the stored OAuth credential unused unless one is explicitly selected. Claude Code
+asks before using a key it did not obtain itself; OMP does not ask. On a machine
+that loads the key from a keychain into every interactive shell, that turns a
+subscription session into a metered one with nothing on screen to say so.
+
+The unset covers `omp` alone. The other launched agents authenticate elsewhere
+and have no reason to lose the key.
+
 ### The Zsh bridge
 
 `launchers/shell-init` is a private `ZDOTDIR` whose startup files source the
