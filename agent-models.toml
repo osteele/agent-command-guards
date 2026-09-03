@@ -1,0 +1,45 @@
+# Shipped defaults for the model-first interactive commands.
+#
+# `home` is the command's native harness -- what `--harness self` selects, and a
+# fact about the command rather than a preference. `default` is the harness an
+# unqualified invocation uses, and is the preference this file exists to carry.
+#
+# Each entry under `routes` is one supported (command, harness) pair. An empty
+# table means the harness needs no extra arguments; `model` and `profile` are
+# rendered with that harness's own flag spelling, which stays in the code.
+#
+# Machine-local overrides live in
+# ${XDG_CONFIG_HOME:-$HOME/.config}/agent-models/config.toml. This file is
+# hand-edited: `agent-model default set` never writes it.
+
+version = 1
+
+[commands.claude]
+home = "claude"
+default = "omp"
+routes.claude = {}
+routes.omp = { model = "anthropic/claude-opus-5" }
+
+[commands.fable]
+home = "claude"
+default = "omp"
+routes.claude = { profile = "fable" }
+routes.omp = { model = "anthropic/claude-fable-5-1" }
+
+[commands.codex]
+home = "codex"
+default = "omp"
+routes.codex = {}
+routes.omp = { model = "openai-codex/gpt-5.6-sol" }
+
+[commands.kimi]
+home = "kimi"
+default = "omp"
+routes.kimi = { model = "kimi-code/k3" }
+routes.omp = { model = "kimi-code/k3" }
+
+[commands.glm]
+home = "opencode"
+default = "omp"
+routes.opencode = { model = "zai-coding-plan/glm-5.3-flash" }
+routes.omp = { model = "zai/glm-5.3-flash" }

@@ -106,9 +106,30 @@ The short form is consumed only when the next word is a known harness. A bare
 `-h`, or `-h` followed by any other word, remains the selected harness's help
 option. `--harness` reports an unknown value as an error.
 
-Defaults live in
-`${XDG_CONFIG_HOME:-$HOME/.config}/agent-models/config.toml`. A missing file
-uses each model's native harness. The file has a small, checked schema:
+Defaults come from `agent-models.toml` at the repository root. Each command
+names its native harness as `home` — what `--harness self` selects — the harness
+an unqualified invocation uses as `default`, and one entry per supported
+`(command, harness)` pair:
+
+```toml
+version = 1
+
+[commands.glm]
+home = "opencode"
+default = "omp"
+routes.opencode = { model = "zai-coding-plan/glm-5.3-flash" }
+routes.omp = { model = "zai/glm-5.3-flash" }
+```
+
+A route carries a `model` or a `profile`; how each harness spells it —
+`--model=X`, `-m X`, `--profile X` — is the harness's API and stays in the code.
+An empty table is a harness that needs no extra arguments. `home` and `default`
+must name routes that exist, which is checked at load, so a bad edit fails on the
+next command rather than resolving to something unintended.
+
+Machine-local overrides live in
+`${XDG_CONFIG_HOME:-$HOME/.config}/agent-models/config.toml`, which selects a
+harness per command and nothing else:
 
 ```toml
 version = 1
@@ -116,28 +137,25 @@ version = 1
 [defaults]
 claude = "claude"
 fable = "claude"
-codex = "omp"
-kimi = "omp"
-glm = "omp"
 ```
 
-Use the CLI to inspect or change it without editing the repository:
+The CLI reads and writes that file only; `agent-models.toml` is hand-edited:
 
 ```bash
 agent-model default list
 agent-model default get codex
-agent-model default set codex omp
-agent-model default reset codex
+agent-model default set glm opencode
+agent-model default reset glm
 agent-model resolve codex -h self
 agent-model config path
 agent-model config check
 agent-model doctor
 ```
 
-The native Claude routes resolve `claude` through `PATH`, so an installed
-`claude-wrapper` remains responsible for profiles and command guards. The OMP
-routes use provider-qualified model selectors for Anthropic, Fable, Codex,
-Kimi Code, and the Z.AI coding plan.
+Every command ships defaulting to OMP. The native Claude routes resolve `claude`
+through `PATH`, so an installed `claude-wrapper` remains responsible for profiles
+and command guards. The OMP routes use provider-qualified model selectors for
+Anthropic, Fable, Codex, Kimi Code, and the Z.AI coding plan.
 
 ### CPU priority
 
@@ -329,7 +347,7 @@ The suite uses `unittest`. It drives the real wrappers as subprocesses against
 temporary repositories and fake binaries, so it exercises the files that agents
 actually run.
 
-CI runs it on Linux, macOS, and Windows across Python 3.10–3.14. Windows runs
+CI runs it on Linux, macOS, and Windows across Python 3.11–3.14. Windows runs
 the portable suites (parsers, state, size parsing, mocked monitors); suites that
 need POSIX shells, `which(1)`, process groups, or memory monitors skip there
 with their reason. Linux and macOS jobs install `jj` from its latest release so
