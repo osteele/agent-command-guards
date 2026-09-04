@@ -43,3 +43,16 @@ accepting D.*
   if this directory moves. The convention prefers an enforceable invariant here:
   a test asserting every entry in `shadows/` and `launchers/` is an intended
   command name would protect this better than prose.
+
+
+- **2026-09-04** — In the context of wrapper startup, facing a cost paid on
+  every guarded `git`, `ssh`, `rsync`, and `uv run` an agent issues, we decided
+  to hold a per-invocation latency budget enforced by
+  `tests/test_startup_budget.py`, and neglected recording "standard library
+  only" as the rule, because that is one means to the budget rather than the
+  requirement and a different implementation that keeps the budget is welcome;
+  accepting that the test measures overhead relative to interpreter startup and
+  skips when the machine is too loaded to measure, so it bounds regressions
+  rather than proving an absolute latency. How the wrappers meet it today —
+  no third-party imports, no virtualenv, no dependency resolution — is in
+  `CLAUDE.md`, not here.
