@@ -43,5 +43,8 @@ correction. For how the wrappers behave today, read `README.md`.
 
 ## Records
 
-None yet. Candidates are listed in [log.md](log.md) where they were recorded at
-the lighter tier.
+| # | Decision | Adopted |
+| --- | --- | --- |
+| [0001](0001-git-shadow-fails-closed.md) | The git shadow refuses unclassified subcommands | 2026-09-04 |
+
+Decisions recorded at the lighter tier are in [log.md](log.md).
