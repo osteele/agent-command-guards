@@ -15,8 +15,9 @@ sampled in the same window as the subject. A baseline taken once and compared
 against samples collected later can yield a *negative* overhead when load
 arrives in between, which is impossible (loading a module cannot beat loading
 nothing) and is proof that the two windows were not comparable. So each
-iteration measures both and the minimum difference wins; a negative result is
-treated as a broken instrument and skips rather than passing or failing.
+iteration measures both, and the least subject cost is compared against the
+least baseline cost from the same window; a negative result is treated as a
+broken instrument and skips rather than passing or failing.
 """
 
 from __future__ import annotations
@@ -30,8 +31,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 # Module-load overhead attributable to the wrapper, above interpreter startup.
-# Generous: a single third-party import typically costs several times this,
-# while the wrappers today sit an order of magnitude below it.
+# Generous: a single third-party import typically costs several times this.
+# Measured on a loaded laptop, the wrappers sit between 8ms and 43ms.
 BUDGET_MS = 150.0
 
 RUNS = 7
@@ -78,8 +79,8 @@ def _overhead_ms(argv: list[str]) -> float:
 
     Both minima come from one interleaved window, so load that arrives during
     the run inflates both series rather than only one. Comparing minima rather
-    than averaging per-iteration differences matters: the minimum of noisy
-    differences is biased downward, because it selects the iteration whose
+    than taking the minimum per-iteration difference matters: the minimum of
+    noisy differences is biased downward, because it selects the iteration whose
     baseline was slowest and whose subject was fastest.
     """
     baselines: list[float] = []
