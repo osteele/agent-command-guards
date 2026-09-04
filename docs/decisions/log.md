@@ -44,7 +44,6 @@ accepting D.*
   a test asserting every entry in `shadows/` and `launchers/` is an intended
   command name would protect this better than prose.
 
-
 - **2026-09-04** — In the context of wrapper startup, facing a cost paid on
   every guarded `git`, `ssh`, `rsync`, and `uv run` an agent issues, we decided
   to hold a per-invocation latency budget enforced by

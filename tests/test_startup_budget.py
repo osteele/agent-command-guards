@@ -9,11 +9,14 @@ is fine. This test measures the requirement so the means stays free to change.
 What it catches is the regression that matters: a dependency whose import cost
 lands on every `git`, `ssh`, `rsync`, and `uv run` an agent issues.
 
-Measurement is relative. Interpreter startup is not the wrapper's fault, so the
-baseline is subtracted, and the minimum of several runs is used because a loaded
-machine inflates individual samples but cannot deflate them. When the baseline
-itself is implausibly slow the machine is too busy to measure and the test skips
-rather than reporting a fault it cannot substantiate.
+Measurement is relative and interleaved. Interpreter startup is not the
+wrapper's fault, so a baseline is subtracted — but the baseline has to be
+sampled in the same window as the subject. A baseline taken once and compared
+against samples collected later can yield a *negative* overhead when load
+arrives in between, which is impossible (loading a module cannot beat loading
+nothing) and is proof that the two windows were not comparable. So each
+iteration measures both and the minimum difference wins; a negative result is
+treated as a broken instrument and skips rather than passing or failing.
 """
 
 from __future__ import annotations
@@ -28,12 +31,10 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Module-load overhead attributable to the wrapper, above interpreter startup.
 # Generous: a single third-party import typically costs several times this,
-# while the largest wrapper today measures around 26ms.
+# while the wrappers today sit an order of magnitude below it.
 BUDGET_MS = 150.0
-# Above this, the machine is too loaded for the measurement to mean anything.
-BASELINE_CEILING_MS = 600.0
 
-RUNS = 5
+RUNS = 7
 
 SUBJECTS = {
     "shadow_wrapper.py": REPO / "shadows" / "shadow_wrapper.py",
@@ -46,46 +47,50 @@ SUBJECTS = {
 # explicitly because three of the four subjects have no `.py` extension —
 # filenames are the command interface here — and the suffix-based helpers
 # return no loader for them. Every subject guards its entry point behind
-# __main__, so import executes definitions only.
+# __main__, so import executes definitions only. dataclasses and typing resolve
+# annotations through sys.modules, so the module registers itself first.
 LOAD_SOURCE = """
 import sys
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 loader = SourceFileLoader("subject", sys.argv[1])
 module = module_from_spec(spec_from_loader("subject", loader))
-# dataclasses and typing resolve annotations through sys.modules, so a module
-# executed outside the import system has to register itself first.
 sys.modules["subject"] = module
 loader.exec_module(module)
 """
 
+BASELINE = [sys.executable, "-c", ""]
 
-def _best_ms(argv: list[str]) -> float:
-    best = float("inf")
+
+def _run_ms(argv: list[str]) -> float:
+    started = time.perf_counter()
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    elapsed = (time.perf_counter() - started) * 1000.0
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{' '.join(argv)} exited {result.returncode}: {result.stderr.strip()}"
+        )
+    return elapsed
+
+
+def _overhead_ms(argv: list[str]) -> float:
+    """Least observed cost of `argv` above interpreter startup.
+
+    Both minima come from one interleaved window, so load that arrives during
+    the run inflates both series rather than only one. Comparing minima rather
+    than averaging per-iteration differences matters: the minimum of noisy
+    differences is biased downward, because it selects the iteration whose
+    baseline was slowest and whose subject was fastest.
+    """
+    baselines: list[float] = []
+    subjects: list[float] = []
     for _ in range(RUNS):
-        started = time.perf_counter()
-        result = subprocess.run(argv, capture_output=True, text=True, check=False)
-        elapsed = (time.perf_counter() - started) * 1000.0
-        if result.returncode != 0:
-            raise AssertionError(
-                f"{' '.join(argv)} exited {result.returncode}: {result.stderr.strip()}"
-            )
-        best = min(best, elapsed)
-    return best
+        baselines.append(_run_ms(BASELINE))
+        subjects.append(_run_ms(argv))
+    return min(subjects) - min(baselines)
 
 
 class StartupBudgetTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.baseline = _best_ms([sys.executable, "-c", ""])
-
-    def setUp(self) -> None:
-        if self.baseline > BASELINE_CEILING_MS:
-            self.skipTest(
-                f"interpreter baseline {self.baseline:.0f}ms exceeds "
-                f"{BASELINE_CEILING_MS:.0f}ms; machine too loaded to measure"
-            )
-
     def test_every_subject_is_present(self) -> None:
         """A renamed or moved wrapper must not silently drop out of coverage."""
         for name, path in SUBJECTS.items():
@@ -95,13 +100,17 @@ class StartupBudgetTest(unittest.TestCase):
     def test_wrapper_load_stays_within_budget(self) -> None:
         for name, path in SUBJECTS.items():
             with self.subTest(subject=name):
-                loaded = _best_ms([sys.executable, "-c", LOAD_SOURCE, str(path)])
-                overhead = loaded - self.baseline
+                overhead = _overhead_ms([sys.executable, "-c", LOAD_SOURCE, str(path)])
+                if overhead < 0:
+                    self.skipTest(
+                        f"{name} measured {overhead:.0f}ms, which is impossible; "
+                        "the machine is too loaded for this measurement to mean "
+                        "anything"
+                    )
                 self.assertLess(
                     overhead,
                     BUDGET_MS,
-                    f"{name} adds {overhead:.0f}ms over interpreter startup "
-                    f"({loaded:.0f}ms vs {self.baseline:.0f}ms baseline), above "
+                    f"{name} adds {overhead:.0f}ms over interpreter startup, above "
                     f"the {BUDGET_MS:.0f}ms budget. This cost is paid on every "
                     "guarded command in every agent session.",
                 )
