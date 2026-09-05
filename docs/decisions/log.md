@@ -55,3 +55,19 @@ accepting D.*
   rather than proving an absolute latency. How the wrappers meet it today —
   no third-party imports, no virtualenv, no dependency resolution — is in
   `CLAUDE.md`, not here.
+
+- **2026-09-05** — In the context of three reopened review cycles covering the
+  same change, facing two whose subject was a working-copy state amended away
+  the same hour, we decided to cancel those two as superseded and retry only the
+  cycle whose target is the shipped diff, and neglected retrying all three as
+  reopened, because `jj evolog -r vpupoxvolrlk` shows one change amended at
+  01:11:16, 01:22:00 and 01:46:32 with the cycles opened seconds after each
+  (01:12:16, 01:22:55, 01:46:40), so two of the three name diffs that exist only
+  in the evolog and no reviewer can be dispatched at them; accepting that
+  `review cancel` records a `cancellation_actor` but has no evidence field, so
+  the register says who retired them and this entry is the only place that says
+  why. Cycles `0fbc856e` and `f41a7e9f` cancelled, no verdict asserted about the
+  change; `db2103ce` (target `dd8988181aea`) retried separately. The group had
+  been reopen-eligible but not actionable for four days: at the frozen 20.0s ctx
+  budget a retry could only fail identically, until agent-review
+  `mqoznwmrnnvy` added `review retry --timeout`.

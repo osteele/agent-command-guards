@@ -302,7 +302,10 @@ is_allowlisted_read_command() {
             return 0
             ;;
         branch)
-            branch_is_read_only "${SUBCMD_ARGS[@]}"
+            # macOS ships bash 3.2, where "${arr[@]}" on an empty array is an
+            # unbound-variable error under `set -u`. Bare `git branch` has no
+            # arguments and is read-only, so it must survive this call.
+            branch_is_read_only ${SUBCMD_ARGS[@]+"${SUBCMD_ARGS[@]}"}
             return
             ;;
         *)
@@ -330,7 +333,7 @@ if [[ "$SUBCMD" == "commit" ]]; then
     if jj_root="$(find_guarded_jj_root)"; then
         local_args=()
         amend=false
-        for arg in "${SUBCMD_ARGS[@]}"; do
+        for arg in ${SUBCMD_ARGS[@]+"${SUBCMD_ARGS[@]}"}; do
             case "$arg" in
                 --amend) amend=true ;;
                 # Flags that jj commit/describe also accepts
@@ -343,9 +346,9 @@ if [[ "$SUBCMD" == "commit" ]]; then
         done
         cd -- "$GIT_SEARCH_DIR"
         if $amend; then
-            exec jj -R "$jj_root" describe "${local_args[@]}"
+            exec jj -R "$jj_root" describe ${local_args[@]+"${local_args[@]}"}
         else
-            exec jj -R "$jj_root" commit "${local_args[@]}"
+            exec jj -R "$jj_root" commit ${local_args[@]+"${local_args[@]}"}
         fi
     fi
 fi
@@ -499,7 +502,7 @@ handle_worktree() {
 
 if [[ "$SUBCMD" == "worktree" ]]; then
     if jj_root="$(find_guarded_jj_root)"; then
-        if handle_worktree "$jj_root" "${SUBCMD_ARGS[@]}"; then
+        if handle_worktree "$jj_root" ${SUBCMD_ARGS[@]+"${SUBCMD_ARGS[@]}"}; then
             true  # handled via exec/exit inside handle_worktree
         fi
     fi

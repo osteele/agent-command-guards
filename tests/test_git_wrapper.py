@@ -199,6 +199,39 @@ class GitShadowIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("supported through a compatibility layer", result.stderr)
 
+    # --- bash 3.2 empty-array expansion -----------------------------------
+    #
+    # macOS ships bash 3.2, where "${arr[@]}" on an *empty* array is an
+    # unbound-variable error under `set -u`. Every branch of the wrapper that
+    # expands a subcommand's argument array must therefore survive being given
+    # no arguments at all. The three tests above all pass arguments, which is
+    # why a regression that broke bare `git branch` outright shipped and stayed
+    # green on the macOS CI job.
+
+    def test_bare_branch_survives_empty_argument_array(self) -> None:
+        result = self.run_shadow("branch")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("supported through a compatibility layer", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_bare_worktree_refuses_rather_than_crashing(self) -> None:
+        result = self.run_shadow("worktree")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing unsupported `git worktree`", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_bare_commit_survives_empty_argument_array(self) -> None:
+        # `git commit` with no arguments builds an empty `local_args` and then
+        # expands it into `jj commit`. A stub editor keeps this deterministic:
+        # the assertion is about surviving the expansion, not about the commit.
+        environment = dict(self.environment)
+        environment["JJ_EDITOR"] = "true"
+        result = self.run_shadow("commit", env=environment)
+
+        self.assertNotIn("unbound variable", result.stderr)
+
     def test_unknown_worktree_command_is_denied(self) -> None:
         result = self.run_shadow("worktree", "lock", str(self.repo))
 
