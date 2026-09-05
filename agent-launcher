@@ -42,15 +42,56 @@ needs_shell_bridge() {
     esac
 }
 
+# mise shims are symlinks to the mise binary itself, which decides at call
+# time which real tool to exec. When no version is active for the tool it
+# falls back to re-scanning PATH, which loops straight back into this
+# launcher if the launcher is also first on PATH (as `omp` was: mise had no
+# active oh-my-pi version, so its shim re-executed the launcher, which found
+# the shim again, forever). `mise which` performs the same lookup as a fast,
+# synchronous config read with no exec chain, so route shim candidates
+# through it instead of trusting or running the shim directly.
+MISE_BIN_REALPATH_CHECKED=0
+MISE_BIN_REALPATH=""
+
+mise_bin_realpath() {
+    if [[ "$MISE_BIN_REALPATH_CHECKED" -eq 0 ]]; then
+        MISE_BIN_REALPATH_CHECKED=1
+        if command -v mise >/dev/null 2>&1; then
+            MISE_BIN_REALPATH="$(realpath "$(command -v mise)" 2>/dev/null || true)"
+        fi
+    fi
+    printf '%s\n' "$MISE_BIN_REALPATH"
+}
+
+resolve_via_mise() {
+    local resolved real_resolved
+    resolved="$(mise which "$NAME" 2>/dev/null || true)"
+    [[ -n "$resolved" && -x "$resolved" ]] || return 1
+    real_resolved="$(realpath "$resolved" 2>/dev/null || true)"
+    [[ -n "$real_resolved" && "$real_resolved" != "$SCRIPT_PATH" ]] || return 1
+    printf '%s\n' "$resolved"
+}
+
 find_real_binary() {
-    local candidate real_candidate
+    local candidate real_candidate mise_bin resolved
+
+    mise_bin="$(mise_bin_realpath)"
 
     while IFS= read -r candidate; do
         real_candidate="$(realpath "$candidate" 2>/dev/null || true)"
-        if [[ -n "$real_candidate" && "$real_candidate" != "$SCRIPT_PATH" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
+        [[ -n "$real_candidate" ]] || continue
+        [[ "$real_candidate" == "$SCRIPT_PATH" ]] && continue
+
+        if [[ -n "$mise_bin" && "$real_candidate" == "$mise_bin" ]]; then
+            if resolved="$(resolve_via_mise)"; then
+                printf '%s\n' "$resolved"
+                return 0
+            fi
+            continue
         fi
+
+        printf '%s\n' "$candidate"
+        return 0
     done < <(which -a "$NAME" 2>/dev/null)
 
     while IFS= read -r candidate; do
