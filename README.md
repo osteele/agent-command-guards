@@ -182,22 +182,27 @@ inherits that parent's session id, and answering to it would attribute this
 session's work to the parent. Minting unconditionally does the same for an
 inherited `AGENT_SESSION_ID`.
 
-### Anthropic credentials
+### Provider credentials
 
-The launcher unsets `ANTHROPIC_API_KEY` before starting `omp`. Set
-`AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY=1` to keep it.
+The launcher unsets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` before starting
+`omp`. Set `AGENT_LAUNCHER_KEEP_API_KEYS=1` to keep them.
 
 OMP treats a key it finds in the environment as being logged in: the provider
-list shows Anthropic as `logged in (env)` rather than `(login)`, and requests
+list shows the provider as `logged in (env)` rather than `(login)`, and requests
 bill at API rates instead of against the subscription. Authorizing the
 subscription afterwards does not displace it, because an environment key leaves
 the stored OAuth credential unused unless one is explicitly selected. Claude Code
 asks before using a key it did not obtain itself; OMP does not ask. On a machine
-that loads the key from a keychain into every interactive shell, that turns a
+that loads keys from a keychain into every interactive shell, that turns a
 subscription session into a metered one with nothing on screen to say so.
 
+`OPENAI_API_KEY` was set in every agent session when this was measured on
+2026-09-05, so OMP routed to `openai-codex` was billing per token for the same
+reason Anthropic would have been. Z.AI is deliberately absent: its only
+available key bills the GLM coding plan, so a key there *is* the subscription.
+
 The unset covers `omp` alone. The other launched agents authenticate elsewhere
-and have no reason to lose the key.
+and have no reason to lose the keys.
 
 ### The Zsh bridge
 

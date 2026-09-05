@@ -27,6 +27,7 @@ REPORT_ENVIRONMENT = (
     "printf 'claude_session=%s\\n' \"${CLAUDE_CODE_SESSION_ID:-}\"\n"
     "printf 'codex_thread=%s\\n' \"${CODEX_THREAD_ID:-}\"\n"
     "printf 'anthropic_key=%s\\n' \"${ANTHROPIC_API_KEY:-}\"\n"
+    "printf 'openai_key=%s\\n' \"${OPENAI_API_KEY:-}\"\n"
     "printf 'resolved_omp=%s\\n' \"$(command -v omp 2>/dev/null || true)\"\n"
     "printf 'niceness=%s\\n' \"$(ps -o nice= -p $$ | tr -d ' ')\"\n"
 )
@@ -53,7 +54,7 @@ class AgentLauncherTest(unittest.TestCase):
         self.environment.pop("ZDOTDIR", None)
         self.environment.pop("AGENT_COMMAND_GUARDS_ACTIVE", None)
         self.environment.pop("ANTHROPIC_API_KEY", None)
-        self.environment.pop("AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY", None)
+        self.environment.pop("AGENT_LAUNCHER_KEEP_API_KEYS", None)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -173,32 +174,38 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn(f"resolved_omp={real}", result.stdout)
         self.assertIn(f"first_on_path={SHADOWS / 'uv'}", result.stdout)
 
-    def test_omp_does_not_inherit_an_anthropic_api_key(self) -> None:
+    def test_omp_does_not_inherit_provider_api_keys(self) -> None:
         # OMP reads an env key as being logged in, bills it at API rates, and
-        # lets it suppress the stored subscription credential. The key reaches
-        # every interactive shell from the keychain, so it arrives inherited.
+        # lets it suppress the stored subscription credential. The keys reach
+        # every interactive shell from the keychain, so they arrive inherited.
         self.install_real("omp")
         self.environment["ANTHROPIC_API_KEY"] = "sk-ant-inherited"
+        self.environment["OPENAI_API_KEY"] = "sk-openai-inherited"
         result = self.launch("omp")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("anthropic_key=\n", result.stdout)
+        self.assertIn("openai_key=\n", result.stdout)
 
-    def test_omp_keeps_the_anthropic_api_key_when_asked(self) -> None:
+    def test_omp_keeps_provider_api_keys_when_asked(self) -> None:
         self.install_real("omp")
         self.environment["ANTHROPIC_API_KEY"] = "sk-ant-inherited"
-        self.environment["AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY"] = "1"
+        self.environment["OPENAI_API_KEY"] = "sk-openai-inherited"
+        self.environment["AGENT_LAUNCHER_KEEP_API_KEYS"] = "1"
         result = self.launch("omp")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("anthropic_key=sk-ant-inherited\n", result.stdout)
+        self.assertIn("openai_key=sk-openai-inherited\n", result.stdout)
 
-    def test_other_agents_keep_the_anthropic_api_key(self) -> None:
-        # Only OMP resolves Anthropic credentials from the environment without
-        # an approval gate; the other agents have no reason to lose the key.
+    def test_other_agents_keep_provider_api_keys(self) -> None:
+        # Only OMP resolves provider credentials from the environment without
+        # an approval gate; the other agents have no reason to lose the keys.
         self.install_real("kimi")
         self.environment["ANTHROPIC_API_KEY"] = "sk-ant-inherited"
+        self.environment["OPENAI_API_KEY"] = "sk-openai-inherited"
         result = self.launch("kimi")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("anthropic_key=sk-ant-inherited\n", result.stdout)
+        self.assertIn("openai_key=sk-openai-inherited\n", result.stdout)
 
     def test_each_launch_gets_a_distinct_session_id(self) -> None:
         self.install_real("kimi")

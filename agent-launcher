@@ -229,16 +229,23 @@ if [[ "$NAME" == "omp" && "${1:-}" == "update" ]]; then
     prepend_path_once "$(dirname "$REAL_BINARY")"
 fi
 
-# OMP counts an inherited ANTHROPIC_API_KEY as being logged in: its provider list
-# reports Anthropic as `logged in (env)` and every request bills at API rates. An
-# env key also suppresses a stored OAuth credential unless one is explicitly
+# OMP counts an inherited provider key as being logged in: its provider list
+# reports the provider as `logged in (env)` and every request bills at API rates.
+# An env key also suppresses a stored OAuth credential unless one is explicitly
 # selected, so authorizing the subscription does not by itself take effect. Claude
 # Code gates a key it did not obtain itself behind an approval prompt; OMP has no
-# such gate, and this machine loads the key from the keychain into every
-# interactive shell. Set AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY=1 to bill the API
-# deliberately.
-if [[ "$NAME" == "omp" && -z "${AGENT_LAUNCHER_KEEP_ANTHROPIC_API_KEY:-}" ]]; then
+# such gate, and this machine loads keys from the keychain into every interactive
+# shell.
+#
+# `OPENAI_API_KEY` was found set in every agent session on 2026-09-05, so OMP
+# routed to `openai-codex` was billing per token exactly as Anthropic would have
+# been. Z.AI is deliberately absent: its only available key bills the GLM coding
+# plan, so a key there *is* the subscription.
+#
+# Set AGENT_LAUNCHER_KEEP_API_KEYS=1 to bill the API deliberately.
+if [[ "$NAME" == "omp" && -z "${AGENT_LAUNCHER_KEEP_API_KEYS:-}" ]]; then
     unset ANTHROPIC_API_KEY
+    unset OPENAI_API_KEY
 fi
 
 # Per-session identity, so agent-mail can address one of several sessions
