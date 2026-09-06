@@ -23,7 +23,7 @@ routes.omp = { model = "anthropic/claude-opus-5" }
 [commands.fable]
 home = "claude"
 default = "omp"
-routes.claude = { profile = "fable" }
+routes.claude = { model = "fable" }
 routes.omp = { model = "anthropic/claude-fable-5-1" }
 
 [commands.codex]

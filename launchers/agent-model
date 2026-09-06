@@ -20,16 +20,16 @@ DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "agent-models.toml"
 # How each harness spells the fields a route may carry. A flag ending in "="
 # joins its value; anything else passes the value as the following argument.
 # Flag spellings are the harness's API, not a preference, so they stay here
-# while the model and profile names they carry live in the defaults file.
+# while the model names they carry live in the defaults file.
 HARNESS_FLAGS: dict[str, dict[str, str]] = {
-    "claude": {"profile": "--profile"},
+    "claude": {"model": "--model"},
     "codex": {},
     "kimi": {"model": "-m"},
     "opencode": {"model": "-m"},
     "omp": {"model": "--model="},
 }
 # Rendered in this order, so an invocation does not depend on file key order.
-ROUTE_FIELDS = ("profile", "model")
+ROUTE_FIELDS = ("model",)
 
 
 class ConfigError(ValueError):

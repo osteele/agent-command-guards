@@ -94,7 +94,7 @@ class AgentModelTest(unittest.TestCase):
         # it stays in the code, and the spellings disagree.
         expected = {
             "claude": "claude",
-            "fable": "claude --profile fable",
+            "fable": "claude --model fable",
             "codex": "codex",
             "kimi": "kimi -m kimi-code/k3",
             "glm": "opencode -m zai-coding-plan/glm-5.3-flash",
