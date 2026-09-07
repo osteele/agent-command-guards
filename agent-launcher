@@ -219,6 +219,43 @@ new_session_id() {
     fi
 }
 
+# The session id an explicit resume argument names, or non-zero when the
+# command line names none. Each agent spells the flag differently, and the
+# value shapes differ too: kimi prefixes a uuid with `session_` (its own
+# "To resume this session:" hint prints `kimi -r session_<uuid>`), opencode
+# uses `ses_` followed by an opaque token, omp and codex use a bare uuid.
+#
+# Matched against a shape rather than accepted verbatim, so that `--last`, a
+# path, or a session *name* does not become an address.
+resume_id_from_args() {
+    local flags name value
+    case "$NAME" in
+        kimi)     flags=" -r --resume -S --session " ;;
+        omp)      flags=" -r --resume " ;;
+        codex)    flags=" resume " ;;
+        opencode) flags=" -s --session " ;;
+        *)        return 1 ;;
+    esac
+    local uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    while [[ $# -gt 0 ]]; do
+        name="$1"
+        value=""
+        if [[ "$name" == *=* ]]; then
+            value="${name#*=}"
+            name="${name%%=*}"
+        fi
+        if [[ "$flags" == *" $name "* ]]; then
+            [[ -z "$value" ]] && value="${2:-}"
+            if [[ "$value" =~ ^(session_)?${uuid}$ || "$value" =~ ^ses_[A-Za-z0-9]{10,}$ ]]; then
+                printf '%s\n' "$value"
+                return 0
+            fi
+        fi
+        shift
+    done
+    return 1
+}
+
 REAL_BINARY="$(find_real_binary)"
 
 # OMP's updater resolves `omp` from PATH to decide which installation it owns.
@@ -264,7 +301,21 @@ fi
 # identity, which is worse than broadcasting -- work would be attributed to one
 # specific wrong session.
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
-AGENT_SESSION_ID="$(new_session_id)"
+# A resumed session is the same session. Minting a fresh id for it would give
+# it a new address on every resume, and downstream a new agent-mail name, so
+# prefer the id named on the command line when there is one.
+#
+# Only an explicit id counts. `--continue` and the interactive pickers name no
+# session, and each agent settles on one only after this launcher has exec'd,
+# so at this point there is nothing to read: those still mint. Reading the
+# agent's own session store instead was rejected -- kimi writes its index
+# entry seconds AFTER its MCP servers have already registered, so the store is
+# empty exactly when this needs an answer.
+if resumed_id="$(resume_id_from_args "$@")"; then
+    AGENT_SESSION_ID="$resumed_id"
+else
+    AGENT_SESSION_ID="$(new_session_id)"
+fi
 export AGENT_SESSION_ID
 # Names the process this id was minted for. `exec` below replaces this shell,
 # so $$ is the agent's own pid. Unsetting above protects an agent this launcher
