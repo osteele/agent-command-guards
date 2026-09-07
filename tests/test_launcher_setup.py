@@ -100,7 +100,13 @@ class LauncherSetupTest(unittest.TestCase):
             self.assertEqual(content.count(BLOCK_END), 1, name)
             self.assertIn(self.sentinel(name), content)
             self.assertIn('. "$HOME/.config/agent-launchers/env"', content)
-            self.assertIn(BLOCK_SOLUTION, content)
+            # .zshenv is sourced on every shell invocation, including
+            # non-interactive ones, and must stay silent; the warning belongs
+            # only in the files a person is present for.
+            if name == ".zshenv":
+                self.assertNotIn(BLOCK_SOLUTION, content)
+            else:
+                self.assertIn(BLOCK_SOLUTION, content)
 
     def test_install_leaves_missing_rc_files_uncreated(self) -> None:
         (self.home / ".zshenv").write_text(f"{self.sentinel('.zshenv')}\n")
@@ -154,7 +160,10 @@ class LauncherSetupTest(unittest.TestCase):
             content = (self.home / name).read_text()
             self.assertEqual(content.count(BLOCK_START), 1, name)
             self.assertEqual(content.count(BLOCK_END), 1, name)
-            self.assertIn(BLOCK_SOLUTION, content)
+            if name == ".zshenv":
+                self.assertNotIn(BLOCK_SOLUTION, content)
+            else:
+                self.assertIn(BLOCK_SOLUTION, content)
 
     def test_install_refuses_to_replace_a_foreign_binary(self) -> None:
         self.bin_dir.mkdir(parents=True)

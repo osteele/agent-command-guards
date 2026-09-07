@@ -69,11 +69,25 @@ remove_block() {
     printf 'Removed managed block from %s\n' "$target"
 }
 
+# add_block <file> [quiet]
+#
+# `quiet` omits the missing-configuration warning. .zshenv is sourced on every
+# shell invocation, including non-interactive ones, and its own header says it
+# must not produce output; a warning there prints on every script and every
+# `ssh host cmd`. The interactive files carry it instead, which is where a
+# person can act on it.
 add_block() {
     local file="$1"
+    local quiet="${2:-}"
     [[ -f "$file" ]] || return 0
+    # What marks a block as already current differs by variant: the warning
+    # text for the interactive files, and the guarded source line for the quiet
+    # one. Matching on the warning alone would rewrite the quiet block on every
+    # run, since it deliberately has no warning to find.
+    local marker="$BLOCK_SOLUTION"
+    [[ "$quiet" == quiet ]] && marker='[ -f "$HOME/.config/agent-launchers/env" ] && .'
     if grep -qF "$BLOCK_START" "$file"; then
-        if grep -qF "$BLOCK_SOLUTION" "$file"; then
+        if grep -qF "$marker" "$file"; then
             printf 'Already configured: %s\n' "$file"
             return 0
         fi
@@ -87,15 +101,23 @@ add_block() {
         printf 'Would add managed block to %s\n' "$file"
         return 0
     fi
-    printf '\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$BLOCK_START" \
-        '# !! Contents within this block are managed by agent-command-guards/launchers/setup !!' \
-        'if [ -f "$HOME/.config/agent-launchers/env" ]; then' \
-        '    . "$HOME/.config/agent-launchers/env"' \
-        'else' \
-        "    printf '%s\\n' '$BLOCK_SOLUTION' >&2" \
-        'fi' \
-        "$BLOCK_END" >> "$file"
+    if [[ "$quiet" == quiet ]]; then
+        printf '\n%s\n%s\n%s\n%s\n' \
+            "$BLOCK_START" \
+            '# !! Contents within this block are managed by agent-command-guards/launchers/setup !!' \
+            '[ -f "$HOME/.config/agent-launchers/env" ] && . "$HOME/.config/agent-launchers/env"' \
+            "$BLOCK_END" >> "$file"
+    else
+        printf '\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+            "$BLOCK_START" \
+            '# !! Contents within this block are managed by agent-command-guards/launchers/setup !!' \
+            'if [ -f "$HOME/.config/agent-launchers/env" ]; then' \
+            '    . "$HOME/.config/agent-launchers/env"' \
+            'else' \
+            "    printf '%s\\n' '$BLOCK_SOLUTION' >&2" \
+            'fi' \
+            "$BLOCK_END" >> "$file"
+    fi
     printf 'Configured: %s\n' "$file"
 }
 
@@ -223,7 +245,7 @@ done
 
 # .zshenv puts the launchers on PATH early. .zshrc and .bashrc run afterwards and
 # let other version managers prepend themselves, so the block runs there too, last.
-add_block "$HOME/.zshenv"
+add_block "$HOME/.zshenv" quiet
 add_block "$HOME/.zshrc"
 add_block "$HOME/.bashrc"
 
