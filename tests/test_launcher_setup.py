@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parent.parent
 LAUNCHER_DIR = REPO / "launchers"
 SETUP = LAUNCHER_DIR / "setup"
 SHADOWS = REPO / "shadows"
-AGENTS = ("kimi", "opencode", "codex", "omp")
+AGENTS = ("kimi", "opencode", "codex", "omp", "agy")
 RC_FILES = (".zshenv", ".zshrc", ".bashrc")
 BLOCK_START = "# >>> agent-launchers initialize >>>"
 BLOCK_END = "# <<< agent-launchers initialize <<<"
@@ -119,6 +119,18 @@ class LauncherSetupTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(second.stdout.count("Already configured"), 3)
         self.assertEqual(second.stdout.count("Already linked"), len(AGENTS))
+
+    def test_agy_is_reached_by_a_shell_function(self) -> None:
+        # agy is the one managed agent PATH cannot intercept: its real binary
+        # sits in ~/.local/bin, ahead of the launcher directory in this
+        # machine's login PATH, so the symlink every other agent relies on
+        # never wins the lookup. The generated env file carries the function
+        # that closes that gap; without it agy runs unguarded.
+        self.seed_rc_files()
+        self.assertEqual(self.run_setup().returncode, 0)
+        env = (self.home / ".config" / "agent-launchers" / "env").read_text()
+        self.assertIn("agy()", env)
+        self.assertIn("launchers/agy", env)
         for name in RC_FILES:
             self.assertEqual((self.home / name).read_text().count(BLOCK_START), 1)
             self.assertEqual((self.home / name).read_text().count(BLOCK_END), 1)

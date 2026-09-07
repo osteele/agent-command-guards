@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Install the agent launchers (kimi, opencode, codex, omp) ahead of their real binaries.
+# Install the agent launchers (kimi, opencode, codex, omp, agy) ahead of their real binaries.
 #
 # The launchers live in this directory rather than the repository root so that
 # putting them on PATH does not also put the command shadows there. Only the
@@ -19,7 +19,7 @@ BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
 BLOCK_START="# >>> agent-launchers initialize >>>"
 BLOCK_END="# <<< agent-launchers initialize <<<"
 BLOCK_SOLUTION='Agent launchers are not configured; run ~/code/agent-tools/agent-command-guards/launchers/setup'
-AGENTS=(kimi opencode codex omp)
+AGENTS=(kimi opencode codex omp agy)
 
 DRY_RUN=false
 UNINSTALL=false
@@ -143,6 +143,20 @@ else
     cat > "$ENV_FILE" <<EOF
 # agent-launchers shell setup (managed by agent-command-guards/launchers/setup)
 export PATH="$LAUNCHER_DIR:\$PATH"
+
+# agy resolves ahead of the launcher directory and cannot be intercepted by
+# PATH. Its real binary lives in ~/.local/bin, which every login shell here
+# puts at the very front -- ahead of this directory -- so the symlink other
+# agents rely on never wins the lookup. An interactive function is the only
+# hook left, and without it agy runs unguarded: it exports no conversation id
+# of its own, so agent-mail names it at random, the lore relay opens with an
+# empty session id, and -- worst of the three -- an agy started inside another
+# agent's session inherits that agent's CLAUDE_CODE_SESSION_ID and files its
+# work under the parent's identity.
+#
+# Subprocesses still resolve the unguarded binary from PATH, as they do for a
+# harness whose launcher they bypass.
+agy() { command "$LAUNCHER_DIR/agy" "\$@"; }
 
 # Restore the command guards to the front of PATH.
 #

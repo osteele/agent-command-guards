@@ -234,6 +234,7 @@ resume_id_from_args() {
         omp)      flags=" -r --resume " ;;
         codex)    flags=" resume " ;;
         opencode) flags=" -s --session " ;;
+        agy)      flags=" --conversation " ;;
         *)        return 1 ;;
     esac
     local uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
