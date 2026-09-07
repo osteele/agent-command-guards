@@ -121,8 +121,8 @@ routes.opencode = { model = "zai-coding-plan/glm-5.3-flash" }
 routes.omp = { model = "zai/glm-5.3-flash" }
 ```
 
-A route carries a `model` or a `profile`; how each harness spells it —
-`--model=X`, `-m X`, `--profile X` — is the harness's API and stays in the code.
+A route carries a `model`; how each harness spells it — `--model=X`, `--model X`,
+`-m X` — is the harness's API and stays in the code.
 An empty table is a harness that needs no extra arguments. `home` and `default`
 must name routes that exist, which is checked at load, so a bad edit fails on the
 next command rather than resolving to something unintended.

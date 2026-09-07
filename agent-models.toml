@@ -5,8 +5,8 @@
 # unqualified invocation uses, and is the preference this file exists to carry.
 #
 # Each entry under `routes` is one supported (command, harness) pair. An empty
-# table means the harness needs no extra arguments; `model` and `profile` are
-# rendered with that harness's own flag spelling, which stays in the code.
+# table means the harness needs no extra arguments; `model` is rendered with
+# that harness's own flag spelling, which stays in the code.
 #
 # Machine-local overrides live in
 # ${XDG_CONFIG_HOME:-$HOME/.config}/agent-models/config.toml. This file is
