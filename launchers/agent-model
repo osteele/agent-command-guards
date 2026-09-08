@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -28,6 +31,20 @@ HARNESS_FLAGS: dict[str, dict[str, str]] = {
     "opencode": {"model": "-m"},
     "omp": {"model": "--model="},
 }
+
+# The model-first commands expose one resume spelling. Each harness receives
+# the spelling from its own CLI instead.
+HARNESS_RESUME_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "claude": ("--resume",),
+    "codex": ("resume",),
+    "kimi": ("--session",),
+    "opencode": ("--session",),
+    "omp": ("--resume",),
+}
+RESUME_ID_PATTERNS = (
+    ("kimi", re.compile(r"session_[0-9a-fA-F-]{36}")),
+    ("opencode", re.compile(r"ses_[A-Za-z0-9]{10,}")),
+)
 # Rendered in this order, so an invocation does not depend on file key order.
 ROUTE_FIELDS = ("model",)
 
@@ -153,16 +170,17 @@ def _canonical_harness(
     commands: dict[str, Command], model: str, harness: str, location: str
 ) -> str:
     command = commands[model]
-    if harness == "self":
+    if harness in {"own", "self"}:
         return command.home
     if harness not in known_harnesses(commands):
-        expected = ", ".join(sorted(known_harnesses(commands) | {"self"}))
+        aliases = {"own", "self"}
+        expected = ", ".join(sorted(known_harnesses(commands) | aliases))
         raise ConfigError(f"{location}: unknown harness {harness!r}; expected {expected}")
     if harness not in command.routes:
         expected = ", ".join(sorted(command.routes))
         raise ConfigError(
             f"{location}: {model} does not support harness {harness!r}; "
-            f"expected {expected} or self"
+            f"expected {expected}, own, or self"
         )
     return harness
 
@@ -240,9 +258,83 @@ def parse_harness_option(
         return _canonical_harness(commands, model, harness, "--harness"), arguments[1:]
     if first == "-h" and len(arguments) > 1:
         candidate = arguments[1]
-        if candidate in known_harnesses(commands) or candidate == "self":
+        aliases = {"own", "self"}
+        if candidate in known_harnesses(commands) or candidate in aliases:
             return _canonical_harness(commands, model, candidate, "-h"), arguments[2:]
     return None, arguments
+
+
+def parse_resume_option(
+    arguments: list[str],
+) -> tuple[bool, str | None, list[str]]:
+    """Remove one launcher-level --resume option and return its session id."""
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--resume":
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+                return (
+                    True,
+                    arguments[index + 1],
+                    arguments[:index] + arguments[index + 2 :],
+                )
+            return True, None, arguments[:index] + arguments[index + 1 :]
+        if argument.startswith("--resume="):
+            session_id = argument.partition("=")[2] or None
+            return True, session_id, arguments[:index] + arguments[index + 1 :]
+    return False, None, arguments
+
+
+def normalize_resume_id(session_id: str) -> tuple[str, str | None]:
+    """Convert an AgentsView canonical id to the harness's native id."""
+    for harness in HARNESS_RESUME_ARGUMENTS:
+        prefix = f"{harness}:"
+        if not session_id.startswith(prefix):
+            continue
+        native_id = session_id.rsplit(":", 1)[-1] if harness == "kimi" else session_id[len(prefix) :]
+        return native_id, harness
+    return session_id, None
+
+
+def infer_resume_harness(session_id: str) -> str | None:
+    """Identify the harness from a native id shape or AgentsView metadata."""
+    for harness, pattern in RESUME_ID_PATTERNS:
+        if pattern.fullmatch(session_id):
+            return harness
+
+    agentsview = shutil.which("agentsview")
+    if agentsview is None:
+        return None
+    try:
+        result = subprocess.run(
+            [agentsview, "session", "get", session_id, "--json"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"agent-model: AgentsView lookup failed: {error}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        print(f"agent-model: AgentsView returned invalid JSON: {error}", file=sys.stderr)
+        return None
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("agent"), str):
+        print("agent-model: AgentsView returned session metadata without an agent", file=sys.stderr)
+        return None
+    harness = metadata["agent"]
+    return harness if harness in HARNESS_RESUME_ARGUMENTS else None
+
+
+def resume_arguments(harness: str, session_id: str | None) -> list[str]:
+    arguments = list(HARNESS_RESUME_ARGUMENTS[harness])
+    if session_id is not None:
+        arguments.append(session_id)
+    return arguments
 
 
 def resolve(
@@ -251,18 +343,41 @@ def resolve(
     if model not in commands:
         raise ConfigError(f"unknown model {model!r}; expected {', '.join(commands)}")
     explicit, forwarded = parse_harness_option(commands, model, arguments)
-    if explicit is None:
-        harness, _ = defaults_with_sources(commands)[model]
-    else:
+    resume_requested, resume_id, forwarded = parse_resume_option(forwarded)
+    prefixed_harness = None
+    if resume_id is not None:
+        resume_id, prefixed_harness = normalize_resume_id(resume_id)
+    inferred = (
+        prefixed_harness or infer_resume_harness(resume_id)
+        if resume_id is not None and explicit is None
+        else None
+    )
+    if explicit is not None:
         harness = explicit
-    return [*commands[model].routes[harness], *forwarded], harness
+    elif inferred is not None:
+        harness = inferred
+    else:
+        harness, _ = defaults_with_sources(commands)[model]
+
+    if harness in commands[model].routes:
+        invocation = list(commands[model].routes[harness])
+    elif resume_requested and inferred == harness:
+        # A resumed session already owns its model. This keeps an inferred
+        # foreign harness usable even when the model command has no route to it.
+        invocation = [harness]
+    else:
+        raise AssertionError(f"unresolved route for {model} through {harness}")
+    if resume_requested:
+        invocation.extend(resume_arguments(harness, resume_id))
+    invocation.extend(forwarded)
+    return invocation, harness
 
 
 def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None:
     print(
         f"""Usage:
-  agent-model launch MODEL [--harness HARNESS | -h HARNESS] [ARG ...]
-  agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [ARG ...]
+  agent-model launch MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION_ID]] [ARG ...]
+  agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION_ID]] [ARG ...]
   agent-model default list
   agent-model default get MODEL
   agent-model default set MODEL HARNESS
@@ -272,7 +387,7 @@ def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None
   agent-model doctor
 
 Models: {", ".join(commands)}
-Harness alias: self selects the model's native harness.
+Harness aliases: own and self select the model's native harness.
 
 The harness option is recognized only immediately after MODEL. A bare -h, or
 -h followed by an unknown harness, is forwarded to the selected harness.""",

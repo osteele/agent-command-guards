@@ -97,19 +97,28 @@ Choose a harness for one invocation with `--harness` or `-h`:
 ```bash
 codex                         # use the configured default harness
 codex --harness codex         # use Codex itself
-codex -h self                 # same: use this model's native harness
+codex -h own                  # same: use this model's native harness
+codex -h self                 # `self` is a synonym for `own`
 claude -h omp                 # use OMP with the current Opus selector
 codex -h                      # pass -h through to the selected harness
 ```
 
-The short form is consumed only when the next word is a known harness. A bare
-`-h`, or `-h` followed by any other word, remains the selected harness's help
-option. `--harness` reports an unknown value as an error.
+The short form is consumed only when the next word is a known harness or the
+`own`/`self` native-harness alias. A bare `-h`, or `-h` followed by any other
+word, remains the selected harness's help option. `--harness` reports an unknown
+value as an error.
+
+Use `--resume SESSION_ID` with every model-first command. The launcher translates
+it to the selected harness's syntax (`resume`, `--resume`, or `--session`). When
+no harness is explicit, AgentsView-prefixed identifiers and distinctive Kimi
+and OpenCode identifier shapes select their native harness. Other identifiers
+are resolved through AgentsView when it is available; an unknown identifier
+uses the configured default harness.
 
 Defaults come from `agent-models.toml` at the repository root. Each command
-names its native harness as `home` — what `--harness self` selects — the harness
-an unqualified invocation uses as `default`, and one entry per supported
-`(command, harness)` pair:
+names its native harness as `home` — what `--harness own` and `--harness self`
+select — the harness an unqualified invocation uses as `default`, and one entry
+per supported `(command, harness)` pair:
 
 ```toml
 version = 1
@@ -146,7 +155,7 @@ agent-model default list
 agent-model default get codex
 agent-model default set glm opencode
 agent-model default reset glm
-agent-model resolve codex -h self
+agent-model resolve codex -h own
 agent-model config path
 agent-model config check
 agent-model doctor
