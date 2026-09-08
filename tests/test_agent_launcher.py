@@ -30,6 +30,7 @@ REPORT_ENVIRONMENT = (
     "printf 'openai_key=%s\\n' \"${OPENAI_API_KEY:-}\"\n"
     "printf 'resolved_omp=%s\\n' \"$(command -v omp 2>/dev/null || true)\"\n"
     "printf 'niceness=%s\\n' \"$(ps -o nice= -p $$ | tr -d ' ')\"\n"
+    "printf 'soft_nofile=%s\\n' \"$(ulimit -Sn)\"\n"
 )
 
 requires_posix = unittest.skipIf(
@@ -53,6 +54,7 @@ class AgentLauncherTest(unittest.TestCase):
         self.environment["HOME"] = str(self.fake_home)
         self.environment.pop("ZDOTDIR", None)
         self.environment.pop("AGENT_COMMAND_GUARDS_ACTIVE", None)
+        self.environment.pop("OPENAI_API_KEY", None)
         self.environment.pop("ANTHROPIC_API_KEY", None)
         self.environment.pop("AGENT_LAUNCHER_KEEP_API_KEYS", None)
 
@@ -143,6 +145,27 @@ class AgentLauncherTest(unittest.TestCase):
         result = self.launch("codex")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"zdotdir={SHELL_INIT}", result.stdout)
+
+    def test_codex_raises_a_low_soft_open_file_limit(self) -> None:
+        self.install_real("codex")
+        launcher = str(LAUNCHER_DIR / "codex")
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                'ulimit -Sn 256; exec "$@"',
+                "bash",
+                launcher,
+            ],
+            capture_output=True,
+            check=False,
+            env=self.environment,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("soft_nofile=65536", result.stdout)
 
     def session_id(self, result: subprocess.CompletedProcess[str]) -> str:
         for line in result.stdout.splitlines():

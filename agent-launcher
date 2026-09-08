@@ -339,6 +339,27 @@ if [[ -x "$SHADOW_DIR/git" ]]; then
     fi
 fi
 
+# Codex 0.153.1 can fan skill discovery out to hundreds of simultaneous file
+# reads. On macOS, processes launched through a GUI can inherit a soft limit of
+# 256 even when interactive shells usually raise it, causing valid skills to be
+# skipped nondeterministically with EMFILE. Raise only Codex's soft limit; the
+# kernel-enforced hard limit remains unchanged.
+if [[ "$NAME" == "codex" ]]; then
+    SOFT_NOFILE="$(ulimit -Sn 2>/dev/null || true)"
+    if [[ "$SOFT_NOFILE" =~ ^[0-9]+$ && "$SOFT_NOFILE" -lt 65536 ]]; then
+        HARD_NOFILE="$(ulimit -Hn 2>/dev/null || true)"
+        TARGET_NOFILE=65536
+        if [[ "$HARD_NOFILE" =~ ^[0-9]+$ && "$HARD_NOFILE" -lt "$TARGET_NOFILE" ]]; then
+            TARGET_NOFILE="$HARD_NOFILE"
+        fi
+        if [[ "$TARGET_NOFILE" -gt "$SOFT_NOFILE" ]] &&
+            ! ulimit -Sn "$TARGET_NOFILE"; then
+            printf 'WARN Could not raise Codex open-file limit above %s\n' \
+                "$SOFT_NOFILE" >&2
+        fi
+    fi
+fi
+
 # Reduced CPU priority for the agent and everything it spawns (children
 # inherit niceness). `nice` only arbitrates contention: on idle cores the agent
 # runs at full speed, and under load the user's interactive work wins. `nice`

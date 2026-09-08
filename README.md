@@ -165,6 +165,13 @@ runs the agent at full speed — so delegated work yields to interactive use and
 costs nothing the rest of the time. Set `AGENT_LAUNCHER_NICE` to change the
 value (`0` disables).
 
+### Codex open-file limit
+
+Codex loads skills concurrently. Its current loader can exceed macOS's default
+soft limit of 256 file descriptors and then skip valid skills with `Too many
+open files (os error 24)`. The Codex launcher raises a lower inherited soft
+limit to 65,536 before starting the binary. It leaves the hard limit unchanged.
+
 ### Session identity
 
 The launcher exports `AGENT_SESSION_ID`, a fresh id per launch, and unsets
