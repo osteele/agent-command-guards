@@ -40,7 +40,6 @@ RUNS = 7
 SUBJECTS = {
     "shadow_wrapper.py": REPO / "shadows" / "shadow_wrapper.py",
     "uv": REPO / "shadows" / "uv",
-    "with-limits": REPO / "shadows" / "with-limits",
     "agent-model": REPO / "launchers" / "agent-model",
 }
 

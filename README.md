@@ -10,7 +10,7 @@ policy has nothing to say.
 Policy applies at the executable boundary, which catches a command however it was
 composed. Provider selection, agent permissions, and tool-request policy belong to
 the launchers and to [agent-tool-policy](https://github.com/osteele/agent-tool-policy), the shared pre-tool
-hook that also calls `with-limits` here by absolute path.
+hook that also calls `with-limits`, resolved on `PATH`.
 
 ## Layout
 
@@ -295,7 +295,7 @@ refuses to touch the primary workspace, the current one, a symlink, or a path th
 is merely similar. A workspace holding changes or untracked files survives unless
 `-f` is supplied.
 
-### uv and with-limits
+### uv, just, and with-limits
 
 The `uv` shadow passes ordinary uv subcommands through unchanged. It runs `uv run`
 under `with-limits`, which watches the resident memory of the whole process tree and
@@ -309,7 +309,9 @@ with-limits -- uv run python experiment.py
 with-limits -c 'just format && uv run python -m unittest && just check'
 ```
 
-The former `ram-guard` name remains as a compatibility alias.
+`with-limits` is the crates.io crate: `cargo install with-limits`. It replaced a
+Python guard that shipped in this repo's `shadows/` until 2026-09-09; the
+`ram-guard` compatibility alias went with it.
 
 The default ceiling is 70% of the memory the host reports as available at launch.
 The remaining 30%, plus everything already in use by the rest of the system, stays
@@ -318,10 +320,9 @@ cannot reserve memory against unrelated processes that grow later.
 
 | Variable | Effect |
 | --- | --- |
-| `LLM_RAM_GUARD_AVAILABLE_FRACTION` | Fraction of available memory to grant (default `0.70`) |
-| `LLM_RAM_GUARD_LIMIT` | A fixed limit such as `8G`, replacing the dynamic calculation |
-| `LLM_RAM_GUARD_QUIET` | Suppress the startup banner |
-| `LLM_RAM_GUARD=off` | Skip the guard for one invocation |
+| `--memory 8G` | A fixed limit, replacing the dynamic calculation (was `LLM_RAM_GUARD_LIMIT`) |
+| `--quiet` | Suppress the startup banner (was `LLM_RAM_GUARD_QUIET`) |
+| `LLM_RAM_GUARD=off` | Skip the guard for one invocation; read by the shadow and the hook, not by the guard |
 | `LLM_MPS_HIGH_WATERMARK_RATIO` | PyTorch MPS hard watermark (default `0.7`) |
 | `LLM_MPS_LOW_WATERMARK_RATIO` | PyTorch MPS soft watermark (default `0.6`) |
 
@@ -342,10 +343,10 @@ Memory comes from `memory_pressure -Q` on macOS and from `MemAvailable` in
 process inspection is permitted, and falls back to an available-memory floor in
 sandboxes that block it.
 
-The shared pre-tool hook in agent-tool-policy wraps `uv run` a second way, by
-rewriting the command to an absolute `with-limits` path. That covers absolute uv
-paths and `mise`/`command` prefixes, which never consult `PATH` and so never reach
-this shadow.
+The shared pre-tool hook in agent-tool-policy wraps `uv run` and `just` by
+rewriting the complete shell request to a `with-limits` invocation. For
+`uv run`, this also covers absolute paths and `mise`/`command` prefixes, which
+never consult `PATH` and so never reach the `uv` shadow.
 
 ## How the wrappers find the real binary
 

@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-GUARD = HERE / "with-limits"
 BYPASS_VALUES = {"0", "false", "no", "off"}
+# The guard is `with-limits` from crates.io (`cargo install with-limits`),
+# found on PATH rather than beside this file: the Python guard that used to
+# live here was retired once the crate covered its contract.
+GUARD_NAME = "with-limits"
+# Set by the guard in the environment of everything it runs. Checking it is
+# what keeps the two entry points -- this shadow and the pre-tool hook -- from
+# wrapping one command twice.
+GUARD_ACTIVE_VARS = ("WITH_LIMITS_ACTIVE", "LLM_RAM_GUARD_ACTIVE")
 GLOBAL_OPTIONS_WITH_VALUES = {
     "--allow-insecure-host",
     "--cache-dir",
@@ -63,16 +71,43 @@ def find_subcommand(args: list[str]) -> str | None:
     return None
 
 
+def guard_already_active() -> bool:
+    return any(os.environ.get(name) == "1" for name in GUARD_ACTIVE_VARS)
+
+
+def find_guard() -> str | None:
+    """Locate the guard binary, ignoring this directory.
+
+    A shadow directory that ever regains a `with-limits` entry would otherwise
+    make the guard exec itself.
+    """
+    found = shutil.which(GUARD_NAME)
+    if found is None:
+        return None
+    return None if Path(found).resolve().parent == HERE else found
+
+
 def main() -> None:
     real_uv = find_real_uv()
     args = sys.argv[1:]
     should_guard = (
         find_subcommand(args) == "run"
         and not guard_disabled()
-        and os.environ.get("LLM_RAM_GUARD_ACTIVE") != "1"
+        and not guard_already_active()
     )
     if should_guard:
-        os.execv(str(GUARD), [str(GUARD), "--", real_uv, *args])
+        guard = find_guard()
+        if guard is None:
+            # Never fall through quietly: an unguarded `uv run` is exactly the
+            # failure this shadow exists to prevent, and it looks like success.
+            print(
+                f"uv shadow: {GUARD_NAME} is not on PATH, so this `uv run` is "
+                "UNGUARDED. Install it with `cargo install with-limits`, or set "
+                "LLM_RAM_GUARD=off to silence this.",
+                file=sys.stderr,
+            )
+        else:
+            os.execv(guard, [guard, "--", real_uv, *args])
     os.execv(real_uv, [real_uv, *args])
 
 
