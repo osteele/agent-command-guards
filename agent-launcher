@@ -219,24 +219,49 @@ new_session_id() {
     fi
 }
 
+# The resume flags each agent spells differently. Shared by the AgentsView
+# prefix strip below and by resume_id_from_args, so the two can never
+# disagree about what counts as a resume argument.
+resume_flags() {
+    case "$NAME" in
+        kimi)     printf '%s' " -r --resume -S --session " ;;
+        omp)      printf '%s' " -r --resume " ;;
+        codex)    printf '%s' " resume " ;;
+        opencode) printf '%s' " -s --session " ;;
+        agy)      printf '%s' " --conversation " ;;
+        *)        return 1 ;;
+    esac
+}
+
+# The AgentsView canonical prefixes that name this agent's sessions, or
+# non-zero for an agent AgentsView does not index. AgentsView lists sessions
+# as `<agent>:<native id>`: `omp:<uuid>`, `codex:<uuid>`, `opencode:ses_<token>`,
+# `kimi:<machine>:<channel>:session_<uuid>` (the native id is everything
+# through the last colon), and `antigravity-cli:<uuid>` -- Antigravity is
+# indexed under its product CLI name while this launcher's symlink is `agy`.
+agentsview_prefixes() {
+    case "$NAME" in
+        agy)                     printf '%s' " antigravity-cli " ;;
+        kimi|opencode|codex|omp) printf '%s' " $NAME " ;;
+        *)                       return 1 ;;
+    esac
+}
+
 # The session id an explicit resume argument names, or non-zero when the
 # command line names none. Each agent spells the flag differently, and the
 # value shapes differ too: kimi prefixes a uuid with `session_` (its own
 # "To resume this session:" hint prints `kimi -r session_<uuid>`), opencode
-# uses `ses_` followed by an opaque token, omp and codex use a bare uuid.
+# uses `ses_` followed by an opaque token, and omp, codex, and agy use a bare
+# uuid.
 #
 # Matched against a shape rather than accepted verbatim, so that `--last`, a
-# path, or a session *name* does not become an address.
+# path, or a session *name* does not become an address. AgentsView-prefixed
+# forms never reach this matcher: the strip below rewrites them to native ids
+# first, which is also what keeps a resumed session on the AGENT_SESSION_ID
+# it launched with.
 resume_id_from_args() {
-    local flags name value
-    case "$NAME" in
-        kimi)     flags=" -r --resume -S --session " ;;
-        omp)      flags=" -r --resume " ;;
-        codex)    flags=" resume " ;;
-        opencode) flags=" -s --session " ;;
-        agy)      flags=" --conversation " ;;
-        *)        return 1 ;;
-    esac
+    local flags name value uuid
+    flags="$(resume_flags)" || return 1
     local uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     while [[ $# -gt 0 ]]; do
         name="$1"
@@ -302,6 +327,62 @@ fi
 # identity, which is worse than broadcasting -- work would be attributed to one
 # specific wrong session.
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
+# AgentsView lists every session under a canonical id, and the natural thing
+# to do with a copied id is to paste it back. The agents resolve only their
+# native ids: `omp --resume omp:<uuid>` fails with `Session "omp:<uuid>" not
+# found` (verified against omp 18.1.15). Rewrite the pasted form in place
+# before anything reads the command line, so the agent sees an id it can
+# resolve and the resume-id matcher below keeps the session on the
+# AGENT_SESSION_ID it was first launched with. Shape-matched like
+# resume_id_from_args: a prefix on anything that is not a native id passes
+# through untouched, and each launcher strips only its own agent's prefix, so
+# `omp --resume codex:<uuid>` reaches omp as typed and fails there.
+if strip_prefixes="$(agentsview_prefixes)"; then
+    strip_flags="$(resume_flags)" || strip_flags=""
+    strip_uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    strip_native_re="^((session_)?${strip_uuid}|ses_[A-Za-z0-9]{10,})$"
+    strip_args=("$@")
+    if [[ ${#strip_args[@]} -gt 0 ]]; then
+        for strip_i in "${!strip_args[@]}"; do
+            strip_name="${strip_args[strip_i]}"
+            strip_value=""
+            if [[ "$strip_name" == *=* ]]; then
+                strip_value="${strip_name#*=}"
+                strip_name="${strip_name%%=*}"
+            fi
+            [[ "$strip_flags" == *" $strip_name "* ]] || continue
+            strip_target="$strip_i"
+            if [[ -z "$strip_value" ]]; then
+                strip_target=$((strip_i + 1))
+                [[ "$strip_target" -lt ${#strip_args[@]} ]] || continue
+                strip_value="${strip_args[strip_target]}"
+            fi
+            strip_stripped=""
+            for strip_prefix in $strip_prefixes; do
+                [[ "$strip_value" == "$strip_prefix:"* ]] || continue
+                if [[ "$NAME" == "kimi" ]]; then
+                    # kimi's canonical id qualifies the native session_<uuid>
+                    # with machine and channel segments.
+                    strip_stripped="${strip_value##*:}"
+                else
+                    strip_stripped="${strip_value#"$strip_prefix:"}"
+                fi
+                break
+            done
+            [[ -n "$strip_stripped" ]] || continue
+            [[ "$strip_stripped" =~ $strip_native_re ]] || continue
+            if [[ "$strip_target" == "$strip_i" ]]; then
+                strip_args[strip_target]="${strip_name}=${strip_stripped}"
+            else
+                strip_args[strip_target]="$strip_stripped"
+            fi
+        done
+        set -- "${strip_args[@]}"
+    fi
+    unset strip_args strip_i strip_name strip_value strip_target strip_stripped
+    unset strip_prefix strip_prefixes strip_flags strip_uuid strip_native_re
+fi
+
 # A resumed session is the same session. Minting a fresh id for it would give
 # it a new address on every resume, and downstream a new agent-mail name, so
 # prefer the id named on the command line when there is one.

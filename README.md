@@ -198,6 +198,13 @@ inherits that parent's session id, and answering to it would attribute this
 session's work to the parent. Minting unconditionally does the same for an
 inherited `AGENT_SESSION_ID`.
 
+An explicit resume id skips the fresh mint and becomes `AGENT_SESSION_ID`, so
+a resumed session keeps the address its mail and tools already know. AgentsView
+lists sessions under canonical ids (`omp:<uuid>`, `codex:<uuid>`,
+`opencode:ses_...`, `kimi:<machine>:<channel>:session_<uuid>`,
+`antigravity-cli:<uuid>`) that the agents themselves do not resolve, so the
+launcher strips its own agent's prefix from a pasted id before exec.
+
 ### Provider credentials
 
 The launcher unsets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` before starting

@@ -33,6 +33,11 @@ REPORT_ENVIRONMENT = (
     "printf 'soft_nofile=%s\\n' \"$(ulimit -Sn)\"\n"
 )
 
+OMP_RESUME_ID = "01a08a08-8116-7034-aab5-dab90db156e0"
+CODEX_RESUME_ID = "01a08a58-6de3-7551-a929-ec2a73ea814e"
+OPENCODE_RESUME_ID = "ses_f75a7947dffef4QMK32qW6RX8O"
+AGY_RESUME_ID = "9006a41f-0f88-4c78-a766-ad1c6d226c60"
+
 requires_posix = unittest.skipIf(
     os.name == "nt", "the launcher and its Zsh bridge are POSIX shell scripts"
 )
@@ -189,6 +194,119 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertNotEqual(self.session_id(result), "")
         lines = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(lines["agent_session_pid"], lines["process_pid"])
+
+    def test_omp_resume_strips_the_picker_prefix_from_its_argument(self) -> None:
+        # OMP's picker shows ids as `omp:<uuid>` but resolves only the bare
+        # uuid, so the launcher rewrites the pasted form before exec. The id
+        # also becomes AGENT_SESSION_ID, so a resumed session keeps the
+        # address it launched with.
+        self.install_real("omp")
+        result = self.launch("omp", "--resume", f"omp:{OMP_RESUME_ID}", "-p", "hi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID} -p hi", result.stdout)
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_omp_resume_strips_the_prefix_from_the_attached_form(self) -> None:
+        self.install_real("omp")
+        result = self.launch("omp", f"--resume=omp:{OMP_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume={OMP_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_omp_resume_strips_the_prefix_from_the_short_flag(self) -> None:
+        self.install_real("omp")
+        result = self.launch("omp", "-r", f"omp:{OMP_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=-r {OMP_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_omp_resume_keeps_a_bare_uuid_unchanged(self) -> None:
+        self.install_real("omp")
+        result = self.launch("omp", "--resume", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_omp_passes_a_non_uuid_prefixed_value_through(self) -> None:
+        # Shape-matched like the resume-id matcher: only `omp:<uuid>` counts,
+        # so an `omp:`-prefixed path or name reaches OMP as typed.
+        self.install_real("omp")
+        result = self.launch("omp", "--resume", "omp:not-a-uuid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("args=--resume omp:not-a-uuid", result.stdout)
+        self.assertNotEqual(self.session_id(result), "omp:not-a-uuid")
+
+    def test_other_agents_get_no_prefix_rewrite(self) -> None:
+        # The rewrite is OMP-specific; kimi's own `session_` prefix must reach
+        # it verbatim, resume identity included.
+        self.install_real("kimi")
+        kimi_id = f"session_{OMP_RESUME_ID}"
+        result = self.launch("kimi", "--resume", kimi_id)
+        self.assertIn(f"args=--resume {kimi_id}", result.stdout)
+        self.assertEqual(self.session_id(result), kimi_id)
+
+    def test_codex_resume_strips_the_prefix_from_its_subcommand_value(self) -> None:
+        self.install_real("codex")
+        result = self.launch("codex", "resume", f"codex:{CODEX_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=resume {CODEX_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), CODEX_RESUME_ID)
+
+    def test_kimi_resume_strips_the_qualified_canonical_id(self) -> None:
+        # AgentsView qualifies kimi's native session_<uuid> with machine and
+        # channel segments; the native id is everything through the last
+        # colon, matching launchers/agent-model's kimi handling.
+        self.install_real("kimi")
+        kimi_id = f"session_{OMP_RESUME_ID}"
+        canonical = f"kimi:wd_weft_b639d530ae70:main:{kimi_id}"
+        result = self.launch("kimi", "--session", canonical)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--session {kimi_id}", result.stdout)
+        self.assertEqual(self.session_id(result), kimi_id)
+
+    def test_kimi_resume_strips_the_simple_prefixed_form(self) -> None:
+        self.install_real("kimi")
+        kimi_id = f"session_{OMP_RESUME_ID}"
+        result = self.launch("kimi", "-r", f"kimi:{kimi_id}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=-r {kimi_id}", result.stdout)
+        self.assertEqual(self.session_id(result), kimi_id)
+
+    def test_opencode_resume_strips_the_prefix(self) -> None:
+        self.install_real("opencode")
+        result = self.launch("opencode", "-s", f"opencode:{OPENCODE_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=-s {OPENCODE_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), OPENCODE_RESUME_ID)
+
+    def test_agy_resume_strips_the_antigravity_cli_prefix(self) -> None:
+        # AgentsView indexes Antigravity under its product CLI name while the
+        # launcher symlink is `agy`.
+        self.install_real("agy")
+        result = self.launch(
+            "agy", "--conversation", f"antigravity-cli:{AGY_RESUME_ID}"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--conversation {AGY_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), AGY_RESUME_ID)
+
+    def test_a_foreign_agentsview_prefix_passes_through(self) -> None:
+        # Each launcher strips only its own agent's prefix: a codex id pasted
+        # into omp is not an omp session, and omp's own not-found error is the
+        # truthful answer.
+        self.install_real("omp")
+        result = self.launch("omp", "--resume", f"codex:{CODEX_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume codex:{CODEX_RESUME_ID}", result.stdout)
+        self.assertNotEqual(self.session_id(result), f"codex:{CODEX_RESUME_ID}")
+
+    def test_a_prefix_agentsview_does_not_use_passes_through(self) -> None:
+        # `agy:` is not an AgentsView form (`antigravity-cli:` is), so a
+        # conversation value carrying it reaches the agent as typed.
+        self.install_real("agy")
+        result = self.launch("agy", "--conversation", f"agy:{AGY_RESUME_ID}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--conversation agy:{AGY_RESUME_ID}", result.stdout)
 
     def test_omp_update_exposes_the_real_binary_to_its_updater(self) -> None:
         real = self.install_real("omp")
