@@ -31,7 +31,7 @@ routes.omp = { model = "anthropic/claude-fable-5-1" }
 home = "codex"
 default = "omp"
 routes.codex = {}
-routes.omp = { model = "openai-codex/gpt-5.6-sol" }
+routes.omp = { model = "openai-codex/gpt-6-astra" }
 
 [commands.kimi]
 home = "kimi"

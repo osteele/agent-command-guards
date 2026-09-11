@@ -86,7 +86,7 @@ class AgentModelTest(unittest.TestCase):
         expected = {
             "claude": "anthropic/claude-opus-5",
             "fable": "anthropic/claude-fable-5-1",
-            "codex": "openai-codex/gpt-5.6-sol",
+            "codex": "openai-codex/gpt-6-astra",
             "kimi": "kimi-code/k3",
             "glm": "zai/glm-5.3-flash",
         }
@@ -132,7 +132,7 @@ class AgentModelTest(unittest.TestCase):
             (
                 "codex",
                 "omp",
-                f"omp --model=openai-codex/gpt-5.6-sol --resume {session_id}",
+                f"omp --model=openai-codex/gpt-6-astra --resume {session_id}",
             ),
         )
         for model, harness, invocation in cases:
@@ -184,7 +184,7 @@ class AgentModelTest(unittest.TestCase):
         self.assertEqual(default.returncode, 0, default.stderr)
         self.assertEqual(
             default.stdout.strip(),
-            "omp --model=openai-codex/gpt-5.6-sol --resume",
+            "omp --model=openai-codex/gpt-6-astra --resume",
         )
 
         native = self.run_model("resolve", "codex", "--harness", "own", "--resume")
@@ -202,7 +202,7 @@ class AgentModelTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.strip(),
-            "omp --model=openai-codex/gpt-5.6-sol --resume abcxyz123",
+            "omp --model=openai-codex/gpt-6-astra --resume abcxyz123",
         )
 
     def test_explicit_harness_wins_without_changing_config(self) -> None:
@@ -212,7 +212,7 @@ class AgentModelTest(unittest.TestCase):
         result = self.run_model("resolve", "codex", "--harness", "omp", "resume")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            result.stdout.strip(), "omp --model=openai-codex/gpt-5.6-sol resume"
+            result.stdout.strip(), "omp --model=openai-codex/gpt-6-astra resume"
         )
         self.assertIn('codex = "codex"', self.config().read_text())
 
