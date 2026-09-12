@@ -99,12 +99,13 @@ codex                         # use the configured default harness
 codex --harness codex         # use Codex itself
 codex -h own                  # same: use this model's native harness
 codex -h self                 # `self` is a synonym for `own`
+codex -h .                    # `.` is a synonym for `self`
 claude -h omp                 # use OMP with the current Opus selector
 codex -h                      # pass -h through to the selected harness
 ```
 
 The short form is consumed only when the next word is a known harness or the
-`own`/`self` native-harness alias. A bare `-h`, or `-h` followed by any other
+`own`/`self`/`.` native-harness alias. A bare `-h`, or `-h` followed by any other
 word, remains the selected harness's help option. `--harness` reports an unknown
 value as an error.
 
@@ -116,8 +117,8 @@ are resolved through AgentsView when it is available; an unknown identifier
 uses the configured default harness.
 
 Defaults come from `agent-models.toml` at the repository root. Each command
-names its native harness as `home` — what `--harness own` and `--harness self`
-select — the harness an unqualified invocation uses as `default`, and one entry
+names its native harness as `home` — what `--harness own`, `--harness self`, and
+`--harness .` select — the harness an unqualified invocation uses as `default`, and one entry
 per supported `(command, harness)` pair:
 
 ```toml

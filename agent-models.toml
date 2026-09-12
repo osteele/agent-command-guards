@@ -1,7 +1,7 @@
 # Shipped defaults for the model-first interactive commands.
 #
 # `home` is the command's native harness -- what `--harness own` selects
-# (`self` is a synonym), and a fact about the command rather than a preference.
+# (`self` and `.` are synonyms), and a fact about the command rather than a preference.
 # `default` is the harness an unqualified invocation uses, and is the preference
 # this file exists to carry.
 #

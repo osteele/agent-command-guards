@@ -170,17 +170,17 @@ def _canonical_harness(
     commands: dict[str, Command], model: str, harness: str, location: str
 ) -> str:
     command = commands[model]
-    if harness in {"own", "self"}:
+    if harness in {"own", "self", "."}:
         return command.home
     if harness not in known_harnesses(commands):
-        aliases = {"own", "self"}
+        aliases = {"own", "self", "."}
         expected = ", ".join(sorted(known_harnesses(commands) | aliases))
         raise ConfigError(f"{location}: unknown harness {harness!r}; expected {expected}")
     if harness not in command.routes:
         expected = ", ".join(sorted(command.routes))
         raise ConfigError(
             f"{location}: {model} does not support harness {harness!r}; "
-            f"expected {expected}, own, or self"
+            f"expected {expected}, own, self, or ."
         )
     return harness
 
@@ -258,7 +258,7 @@ def parse_harness_option(
         return _canonical_harness(commands, model, harness, "--harness"), arguments[1:]
     if first == "-h" and len(arguments) > 1:
         candidate = arguments[1]
-        aliases = {"own", "self"}
+        aliases = {"own", "self", "."}
         if candidate in known_harnesses(commands) or candidate in aliases:
             return _canonical_harness(commands, model, candidate, "-h"), arguments[2:]
     return None, arguments
@@ -387,7 +387,7 @@ def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None
   agent-model doctor
 
 Models: {", ".join(commands)}
-Harness aliases: own and self select the model's native harness.
+Harness aliases: own, self, and . select the model's native harness.
 
 The harness option is recognized only immediately after MODEL. A bare -h, or
 -h followed by an unknown harness, is forwarded to the selected harness.""",

@@ -106,12 +106,13 @@ class AgentModelTest(unittest.TestCase):
             "kimi": "kimi -m kimi-code/k3",
             "glm": "opencode -m zai-coding-plan/glm-5.3-flash",
         }
-        for alias in ("own", "self"):
+        for alias in ("own", "self", "."):
             for model, invocation in expected.items():
-                with self.subTest(alias=alias, model=model):
-                    result = self.run_model("resolve", model, "--harness", alias)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.strip(), invocation)
+                for option in ("--harness", "-h"):
+                    with self.subTest(alias=alias, model=model, option=option):
+                        result = self.run_model("resolve", model, option, alias)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), invocation)
 
     def test_resume_is_spelled_for_each_harness(self) -> None:
         session_id = "abcxyz123"
