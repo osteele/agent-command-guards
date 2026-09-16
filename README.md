@@ -109,12 +109,41 @@ The short form is consumed only when the next word is a known harness or the
 word, remains the selected harness's help option. `--harness` reports an unknown
 value as an error.
 
-Use `--resume SESSION_ID` with every model-first command. The launcher translates
+Use `--resume SESSION` with every model-first command. The launcher translates
 it to the selected harness's syntax (`resume`, `--resume`, or `--session`). When
 no harness is explicit, AgentsView-prefixed identifiers and distinctive Kimi
 and OpenCode identifier shapes select their native harness. Other identifiers
 are resolved through AgentsView when it is available; an unknown identifier
 uses the configured default harness.
+
+`SESSION` does not have to be an identifier. The agent launchers accept the same
+three forms, so `omp --resume "Efficient Deer"` works as well as
+`claude --resume "Efficient Deer"`:
+
+```bash
+codex --resume 01a02c18-042f-7950-8d9a-7d88b50c8cab   # a session id
+codex --resume "Efficient Deer"                       # an agent-mail session name
+codex --resume "the already-verified result"          # text from the transcript
+```
+
+A name is what agent-mail, the dashboards, and a peer's message call a session:
+its display name ("Efficient Deer"), its slug (`efficient-deer`), or the
+project-qualified address (`augur-efficient-deer`). Names come from agent-mail's
+own store, so a session that has exited still resolves.
+
+Transcript text is matched against AgentsView's index of message text, not tool
+arguments or tool output. The session you are typing in is never a candidate: the
+phrase you type to find an old session lands in the current session's transcript.
+
+When several sessions match, the newest wins and the others are named on stderr
+with their ids, so a different one can be selected by id. An explicit harness
+narrows the search to that harness's sessions first. Nothing that resolves as a
+native session id is looked up at all, so an ordinary resume costs nothing.
+
+Resolution needs `launchers/agent-model`, and therefore a `python3` on `PATH`
+that satisfies its 3.11 floor. A query that resolves to another agent's session
+is refused with the command that would work, rather than handed to an agent that
+cannot open it. A query that resolves to nothing reaches the agent as typed.
 
 Defaults come from `agent-models.toml` at the repository root. Each command
 names its native harness as `home` — what `--harness own`, `--harness self`, and
@@ -200,7 +229,9 @@ session's work to the parent. Minting unconditionally does the same for an
 inherited `AGENT_SESSION_ID`.
 
 An explicit resume id skips the fresh mint and becomes `AGENT_SESSION_ID`, so
-a resumed session keeps the address its mail and tools already know. AgentsView
+a resumed session keeps the address its mail and tools already know. A name or a
+line of transcript text resolves to that id before anything reads it, so
+resuming by name lands on the same address as resuming by id. AgentsView
 lists sessions under canonical ids (`omp:<uuid>`, `codex:<uuid>`,
 `opencode:ses_...`, `kimi:<machine>:<channel>:session_<uuid>`,
 `antigravity-cli:<uuid>`) that the agents themselves do not resolve, so the

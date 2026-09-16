@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -307,6 +309,152 @@ class AgentLauncherTest(unittest.TestCase):
         result = self.launch("agy", "--conversation", f"agy:{AGY_RESUME_ID}")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"args=--conversation agy:{AGY_RESUME_ID}", result.stdout)
+
+    # --- resume arguments that are not session ids -------------------------
+    #
+    # The launcher hands anything that is not a native id to
+    # launchers/agent-model, which resolves an agent-mail session name or a
+    # line of transcript text to one. These drive the real agent-model, so they
+    # need an interpreter that satisfies its floor and a fake AgentsView.
+
+    def install_python(self) -> None:
+        """Put this suite's interpreter on PATH as `python3`.
+
+        agent-model runs under `#!/usr/bin/env python3` and needs 3.11 for
+        tomllib. The bare test PATH reaches the system python, which on macOS
+        is older, and a symlink is narrower than adding that interpreter's whole
+        directory -- which would also expose the real AgentsView.
+        """
+        (self.real_bin / "python3").symlink_to(sys.executable)
+
+    def install_session_name(self, session_id: str, display_name: str) -> None:
+        directory = self.fake_home / ".claude" / "agent-mail" / "session-names"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{session_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": session_id,
+                    "assignedAt": "2026-09-01T00:00:00.000Z",
+                    "slug": display_name.lower().replace(" ", "-"),
+                    "displayName": display_name,
+                }
+            )
+        )
+
+    def install_agentsview(
+        self,
+        sessions: dict[str, str] | None = None,
+        found: list[str] | None = None,
+        witness: Path | None = None,
+    ) -> None:
+        metadata = {
+            session_id: json.dumps({"id": session_id, "agent": agent})
+            for session_id, agent in (sessions or {}).items()
+        }
+        matches = json.dumps(
+            {
+                "matches": [
+                    {
+                        "session_id": canonical,
+                        "agent": canonical.split(":", 1)[0],
+                        "timestamp": "2026-09-14T23:07:13.647Z",
+                    }
+                    for canonical in (found or [])
+                ]
+            }
+        )
+        script = ["#!/bin/sh"]
+        if witness is not None:
+            script.append(f"printf '%s\\n' \"$*\" >> {witness}")
+        script.append('case "$2" in')
+        script.append('  get) case "$3" in')
+        for session_id, document in metadata.items():
+            script.append(f"      {session_id}) printf '%s' '{document}' ;;")
+        script.append('      *) exit 1 ;;')
+        script.append("    esac ;;")
+        script.append(f"  search) printf '%s' '{matches}' ;;")
+        script.append("  *) exit 1 ;;")
+        script.append("esac")
+        path = self.real_bin / "agentsview"
+        path.write_text("\n".join(script) + "\n")
+        path.chmod(0o755)
+
+    def test_resume_resolves_an_agent_mail_session_name(self) -> None:
+        # A name is what a dashboard, a status line, and a peer's mail show;
+        # the id behind it is what the agent resolves.
+        self.install_real("omp")
+        self.install_python()
+        self.install_session_name(OMP_RESUME_ID, "Efficient Deer")
+        self.install_agentsview({OMP_RESUME_ID: "omp"})
+        result = self.launch("omp", "--resume", "Efficient Deer", "-p", "hi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID} -p hi", result.stdout)
+        # The resolved id is the session's address, so mail sent to the name
+        # still reaches it after the resume.
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_resume_resolves_a_name_in_the_attached_form(self) -> None:
+        self.install_real("omp")
+        self.install_python()
+        self.install_session_name(OMP_RESUME_ID, "Efficient Deer")
+        self.install_agentsview({OMP_RESUME_ID: "omp"})
+        result = self.launch("omp", "--resume=efficient-deer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume={OMP_RESUME_ID}", result.stdout)
+
+    def test_resume_resolves_text_from_a_transcript(self) -> None:
+        self.install_real("omp")
+        self.install_python()
+        self.install_agentsview(found=[f"omp:{OMP_RESUME_ID}"])
+        result = self.launch(
+            "omp", "--resume", "The review notification confirms the result"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_resume_refuses_a_session_belonging_to_another_agent(self) -> None:
+        # Rewriting the id anyway would hand omp a codex session and leave it
+        # to report a missing session, which says nothing about where to look.
+        self.install_real("omp")
+        self.install_python()
+        self.install_session_name(CODEX_RESUME_ID, "Efficient Deer")
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+        result = self.launch("omp", "--resume", "Efficient Deer")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is a codex session", result.stderr)
+        self.assertIn(f"codex resume {CODEX_RESUME_ID}", result.stderr)
+        self.assertNotIn("args=", result.stdout)
+
+    def test_an_unresolvable_resume_argument_reaches_the_agent_as_typed(self) -> None:
+        self.install_real("omp")
+        self.install_python()
+        self.install_agentsview()
+        result = self.launch("omp", "--resume", "no such session")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("args=--resume no such session", result.stdout)
+
+    def test_a_native_id_is_resumed_without_any_lookup(self) -> None:
+        # Every guarded launch pays for what this path does, so an id the agent
+        # resolves itself must not reach the resolver at all.
+        self.install_real("omp")
+        self.install_python()
+        witness = self.tmp / "agentsview-calls"
+        self.install_agentsview(witness=witness)
+        result = self.launch("omp", "--resume", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
+        self.assertFalse(witness.exists())
+
+    def test_a_picker_selector_is_not_treated_as_a_name(self) -> None:
+        self.install_real("codex")
+        self.install_python()
+        witness = self.tmp / "agentsview-calls"
+        self.install_agentsview(witness=witness)
+        result = self.launch("codex", "resume", "--last")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("args=resume --last", result.stdout)
+        self.assertFalse(witness.exists())
 
     def test_omp_update_exposes_the_real_binary_to_its_updater(self) -> None:
         real = self.install_real("omp")

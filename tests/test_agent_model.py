@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -333,6 +334,206 @@ class AgentModelTest(unittest.TestCase):
         result = self.run_model("resolve", "codex")
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown model 'cdoex'", result.stderr)
+
+    # --- resume arguments that are not session ids -------------------------
+    #
+    # A session name and a line of transcript text both name a session a person
+    # can see without being able to paste its id.
+
+    def write_session_name(
+        self,
+        session_id: str,
+        display_name: str,
+        assigned_at: str = "2026-09-01T00:00:00.000Z",
+    ) -> None:
+        """Add one record to the agent-mail session-name store this HOME has."""
+        directory = self.home / ".claude" / "agent-mail" / "session-names"
+        directory.mkdir(parents=True, exist_ok=True)
+        slug = display_name.lower().replace(" ", "-")
+        (directory / f"{session_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": session_id,
+                    "assignedAt": assigned_at,
+                    "scheme": "adjective-noun",
+                    "slug": slug,
+                    "displayName": display_name,
+                }
+            )
+        )
+
+    def install_agentsview_router(
+        self,
+        sessions: dict[str, str] | None = None,
+        found: list[tuple[str, str]] | None = None,
+        witness: Path | None = None,
+    ) -> None:
+        """A fake AgentsView: `sessions` maps id to agent, `found` is a search.
+
+        Each entry of `found` is one (canonical id, timestamp) the transcript
+        search reports. `witness` records every call, so a test can assert the
+        lookup was never reached at all.
+        """
+        metadata = {
+            session_id: json.dumps(
+                {"id": session_id, "agent": agent, "project": "p", "started_at": "2026-09-01T00:00:00Z"}
+            )
+            for session_id, agent in (sessions or {}).items()
+        }
+        matches = json.dumps(
+            {
+                "matches": [
+                    {
+                        "session_id": canonical,
+                        "project": "p",
+                        "agent": canonical.split(":", 1)[0],
+                        "timestamp": timestamp,
+                    }
+                    for canonical, timestamp in (found or [])
+                ],
+                "next_cursor": 0,
+            }
+        )
+        script = ["#!/bin/sh"]
+        if witness is not None:
+            script.append(f'printf \'%s\\n\' "$*" >> {witness}')
+        script.append('case "$2" in')
+        script.append("  get)")
+        script.append('    case "$3" in')
+        for session_id, document in metadata.items():
+            script.append(f"      {session_id}) printf '%s' '{document}' ;;")
+        script.append('      *) echo "fatal: session $3 not found" >&2; exit 1 ;;')
+        script.append("    esac ;;")
+        script.append(f"  search) printf '%s' '{matches}' ;;")
+        script.append("  *) exit 1 ;;")
+        script.append("esac")
+        path = self.bin_dir / "agentsview"
+        path.write_text("\n".join(script) + "\n")
+        path.chmod(0o755)
+
+    def test_resume_accepts_an_agent_mail_session_name(self) -> None:
+        session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
+        self.write_session_name(session_id, "Efficient Deer")
+        self.install_agentsview_router({session_id: "codex"})
+        for spelling in ("Efficient Deer", "efficient deer", "efficient-deer"):
+            with self.subTest(spelling=spelling):
+                result = self.run_model("resolve", "glm", "--resume", spelling)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"codex resume {session_id}")
+
+    def test_resume_accepts_the_project_qualified_full_name(self) -> None:
+        session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
+        self.write_session_name(session_id, "Efficient Deer")
+        self.install_agentsview_router({session_id: "codex"})
+        result = self.run_model("resolve", "glm", "--resume", "augur-efficient-deer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"codex resume {session_id}")
+
+    def test_resume_accepts_text_from_a_transcript(self) -> None:
+        session_id = "01a0886b-41a8-7482-a361-86cff36a387f"
+        self.install_agentsview_router(
+            found=[(f"omp:{session_id}", "2026-09-14T23:07:13.647Z")]
+        )
+        result = self.run_model(
+            "resolve", "glm", "--resume", "the already-verified result"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            f"omp --model=zai/glm-5.3-flash --resume {session_id}",
+        )
+
+    def test_transcript_text_selects_the_harness_that_owns_the_session(self) -> None:
+        session_id = "01a02c18-042f-7950-8d9a-7d88b50c8cab"
+        self.install_agentsview_router(
+            found=[(f"codex:{session_id}", "2026-09-14T23:07:13.647Z")]
+        )
+        result = self.run_model("resolve", "glm", "--resume", "some remembered line")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"codex resume {session_id}")
+
+    def test_a_name_naming_several_sessions_takes_the_newest(self) -> None:
+        older = "11111111-1111-4111-8111-111111111111"
+        newer = "22222222-2222-4222-8222-222222222222"
+        self.write_session_name(older, "Noble Ember", "2026-08-01T00:00:00.000Z")
+        self.write_session_name(newer, "Noble Ember", "2026-09-01T00:00:00.000Z")
+        self.install_agentsview_router({older: "codex", newer: "codex"})
+        result = self.run_model("resolve", "glm", "--resume", "Noble Ember")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"codex resume {newer}")
+        self.assertIn("2 sessions match 'Noble Ember'", result.stderr)
+        self.assertIn(older, result.stderr)
+
+    def test_a_name_prefers_a_session_of_the_requested_harness(self) -> None:
+        # An explicit harness narrows a collision: the newest match loses to the
+        # one the user can actually resume with the harness they named.
+        opencode_session = "11111111-1111-4111-8111-111111111111"
+        kimi_session = "22222222-2222-4222-8222-222222222222"
+        self.write_session_name(opencode_session, "Noble Ember", "2026-08-01T00:00:00.000Z")
+        self.write_session_name(kimi_session, "Noble Ember", "2026-09-01T00:00:00.000Z")
+        self.install_agentsview_router(
+            {opencode_session: "opencode", kimi_session: "kimi"}
+        )
+        result = self.run_model(
+            "resolve", "glm", "--harness", "opencode", "--resume", "Noble Ember"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            f"opencode -m zai-coding-plan/glm-5.3-flash --session {opencode_session}",
+        )
+
+    def test_resume_never_resolves_to_the_session_doing_the_asking(self) -> None:
+        # The phrase a person types to find an old session lands in the
+        # transcript of the session they type it in, which the index then finds.
+        current = "33333333-3333-4333-8333-333333333333"
+        other = "44444444-4444-4444-8444-444444444444"
+        self.environment["CLAUDE_CODE_SESSION_ID"] = current
+        self.install_agentsview_router(
+            found=[
+                (f"codex:{current}", "2026-09-16T00:00:00.000Z"),
+                (f"codex:{other}", "2026-09-10T00:00:00.000Z"),
+            ]
+        )
+        result = self.run_model("resolve", "glm", "--resume", "a remembered line")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"codex resume {other}")
+
+    def test_an_unresolvable_resume_argument_reaches_the_harness_as_typed(self) -> None:
+        self.install_agentsview_router()
+        result = self.run_model("resolve", "glm", "--resume", "no such session")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "omp --model=zai/glm-5.3-flash --resume 'no such session'",
+        )
+
+    def test_a_native_session_id_is_never_looked_up(self) -> None:
+        # The lookup is the exception, not the path: an id the harness resolves
+        # itself must not cost a subprocess on every resume.
+        witness = self.tmp / "agentsview-calls"
+        self.install_agentsview_router(witness=witness)
+        session_id = "ses_fa56499a4ffeUGPrn6w4JSed3K"
+        result = self.run_model("resolve", "claude", "--resume", session_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"opencode --session {session_id}")
+        self.assertFalse(witness.exists(), witness.read_text() if witness.exists() else "")
+
+    def test_resolve_session_reports_the_id_harness_and_resume_spelling(self) -> None:
+        session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
+        self.write_session_name(session_id, "Efficient Deer")
+        self.install_agentsview_router({session_id: "kimi"})
+        result = self.run_model("resolve-session", "Efficient Deer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(), [session_id, "kimi", "kimi --session"]
+        )
+
+    def test_resolve_session_reports_no_match_without_failing(self) -> None:
+        self.install_agentsview_router()
+        result = self.run_model("resolve-session", "no such session")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "")
 
     def test_config_path_honors_xdg_config_home(self) -> None:
         custom = self.tmp / "xdg"

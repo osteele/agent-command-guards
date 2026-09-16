@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -45,6 +46,22 @@ RESUME_ID_PATTERNS = (
     ("kimi", re.compile(r"session_[0-9a-fA-F-]{36}")),
     ("opencode", re.compile(r"ses_[A-Za-z0-9]{10,}")),
 )
+# The shapes an agent resolves itself. Anything else named to --resume is a
+# session *name* or transcript text, resolved to one of these before exec.
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+NATIVE_ID_PATTERN = re.compile(rf"(?:session_)?{_UUID}|ses_[A-Za-z0-9]{{10,}}")
+
+# agent-mail's durable store of generated session names, keyed by a hash of the
+# session id: {"sessionId", "assignedAt", "slug", "displayName"}. Read directly
+# because agent-mail's CLI resolves a name only for a *live* session, and a
+# session worth resuming has usually exited. Absent, unreadable, and malformed
+# records are all "no match" rather than an error.
+SESSION_NAMES_DIR = Path.home() / ".claude" / "agent-mail" / "session-names"
+
+# Candidates carried into the per-session AgentsView lookups that a collision
+# needs. A name collides a handful of times at most; this bounds the cost of a
+# pathological one.
+NAME_CANDIDATE_LIMIT = 8
 # Rendered in this order, so an invocation does not depend on file key order.
 ROUTE_FIELDS = ("model",)
 
@@ -296,22 +313,23 @@ def normalize_resume_id(session_id: str) -> tuple[str, str | None]:
     return session_id, None
 
 
-def infer_resume_harness(session_id: str) -> str | None:
-    """Identify the harness from a native id shape or AgentsView metadata."""
-    for harness, pattern in RESUME_ID_PATTERNS:
-        if pattern.fullmatch(session_id):
-            return harness
+def _agentsview_json(arguments: list[str], timeout: float = 10.0) -> object | None:
+    """Run one AgentsView query and return its parsed JSON, or None.
 
+    None covers every way the answer can be missing: AgentsView not installed,
+    the query failing, and output that is not JSON. A miss is not an error here
+    — the caller has other ways to resolve the same value.
+    """
     agentsview = shutil.which("agentsview")
     if agentsview is None:
         return None
     try:
         result = subprocess.run(
-            [agentsview, "session", "get", session_id, "--json"],
+            [agentsview, *arguments, "--json"],
             capture_output=True,
             check=False,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"agent-model: AgentsView lookup failed: {error}", file=sys.stderr)
@@ -319,15 +337,270 @@ def infer_resume_harness(session_id: str) -> str | None:
     if result.returncode != 0:
         return None
     try:
-        metadata = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError as error:
         print(f"agent-model: AgentsView returned invalid JSON: {error}", file=sys.stderr)
         return None
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("agent"), str):
-        print("agent-model: AgentsView returned session metadata without an agent", file=sys.stderr)
+
+
+def session_metadata(session_id: str) -> dict[str, object] | None:
+    """AgentsView's record for one session id, or None when it knows none."""
+    metadata = _agentsview_json(["session", "get", session_id])
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _metadata_harness(metadata: dict[str, object] | None) -> str | None:
+    if metadata is None:
         return None
-    harness = metadata["agent"]
-    return harness if harness in HARNESS_RESUME_ARGUMENTS else None
+    agent = metadata.get("agent")
+    if not isinstance(agent, str):
+        print(
+            "agent-model: AgentsView returned session metadata without an agent",
+            file=sys.stderr,
+        )
+        return None
+    return agent if agent in HARNESS_RESUME_ARGUMENTS else None
+
+
+def infer_resume_harness(session_id: str) -> str | None:
+    """Identify the harness from a native id shape or AgentsView metadata."""
+    for harness, pattern in RESUME_ID_PATTERNS:
+        if pattern.fullmatch(session_id):
+            return harness
+    return _metadata_harness(session_metadata(session_id))
+
+
+class SessionMatch(NamedTuple):
+    """One session a --resume argument could name."""
+
+    session_id: str
+    harness: str | None
+    recency: str
+    label: str
+    indexed: bool = False
+
+
+# Session ids naming the session this process is running inside. Resuming the
+# session you are typing in is never the intent, and a phrase the user has just
+# typed is in that session's transcript, so search finds it.
+CURRENT_SESSION_VARIABLES = (
+    "AGENT_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+)
+
+
+def current_session_ids() -> set[str]:
+    ids = set()
+    for variable in CURRENT_SESSION_VARIABLES:
+        value = os.environ.get(variable, "").strip()
+        if value:
+            ids.add(normalize_resume_id(value)[0])
+    return ids
+
+
+def _name_matches(query: str, slug: str, display_name: str) -> bool:
+    """Whether `query` names this session.
+
+    Accepts what the surfaces show: the display name ("Efficient Deer"), the
+    slug ("efficient-deer"), and the project-qualified full name agent-mail
+    addresses sessions by ("augur-efficient-deer").
+    """
+    normalized = query.casefold()
+    if normalized in (display_name.casefold(), slug.casefold()):
+        return True
+    return bool(slug) and normalized.endswith(f"-{slug.casefold()}")
+
+
+def _name_prefilter(query: str) -> bytes:
+    """The one token every accepted spelling of a name must contain.
+
+    A generated name ends in its noun, whether it arrives as "Efficient Deer",
+    "efficient-deer", or "augur-efficient-deer". Requiring that word of the raw
+    bytes skips the decode and JSON parse for all but a handful of records, and
+    the store holds one per session ever named -- 3700 of them on this machine,
+    where decoding every record costs four times reading them all.
+    """
+    tokens = re.findall(r"[0-9A-Za-z]+", query.casefold())
+    return tokens[-1].encode("ascii") if tokens else b""
+
+
+def sessions_named(query: str, directory: Path = SESSION_NAMES_DIR) -> list[SessionMatch]:
+    """Sessions whose agent-mail name is `query`, most recently named first."""
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return []
+    prefilter = _name_prefilter(query)
+    matches: list[SessionMatch] = []
+    unreadable = 0
+    for entry in entries:
+        if entry.suffix != ".json":
+            continue
+        try:
+            content = entry.read_bytes()
+        except OSError:
+            unreadable += 1
+            continue
+        if prefilter and prefilter not in content.lower():
+            continue
+        try:
+            record = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            unreadable += 1
+            continue
+        if not isinstance(record, dict):
+            unreadable += 1
+            continue
+        session_id = record.get("sessionId")
+        slug = record.get("slug")
+        display_name = record.get("displayName")
+        if not isinstance(session_id, str) or not isinstance(slug, str):
+            unreadable += 1
+            continue
+        if not isinstance(display_name, str):
+            display_name = slug
+        if not _name_matches(query, slug, display_name):
+            continue
+        assigned = record.get("assignedAt")
+        matches.append(
+            SessionMatch(
+                session_id=session_id,
+                harness=None,
+                recency=assigned if isinstance(assigned, str) else "",
+                label=session_id,
+            )
+        )
+    if unreadable and not matches:
+        print(
+            f"agent-model: skipped {unreadable} unreadable session-name "
+            f"records under {directory}",
+            file=sys.stderr,
+        )
+    return _ranked(matches)
+
+
+def _described(match: SessionMatch, metadata: dict[str, object] | None) -> SessionMatch:
+    """Fill in the harness and a human label from AgentsView metadata."""
+    if metadata is None:
+        return match
+    agent = metadata.get("agent")
+    project = metadata.get("project")
+    started = metadata.get("started_at")
+    parts = [part for part in (agent, project) if isinstance(part, str)]
+    if isinstance(started, str):
+        parts.append(started[:10])
+    return match._replace(
+        harness=_metadata_harness(metadata),
+        label=f"{match.label} ({', '.join(parts)})" if parts else match.label,
+        indexed=True,
+    )
+
+
+def sessions_containing(query: str, agent: str | None = None) -> list[SessionMatch]:
+    """Sessions whose transcript contains `query`, most recent match first."""
+    # --fts is the tokenized index over message text. The default search also
+    # reads tool arguments and results, and takes ~40s against this machine's
+    # archive against ~0.5s for the index -- too slow to sit in front of a
+    # launch. Remembered text is almost always something that was *said*.
+    arguments = ["session", "search", query, "--fts", "--limit", "50"]
+    if agent is not None:
+        arguments.extend(("--agent", agent))
+    payload = _agentsview_json(arguments, timeout=30.0)
+    if not isinstance(payload, dict) or not isinstance(payload.get("matches"), list):
+        return []
+    matches: dict[str, SessionMatch] = {}
+    for entry in payload["matches"]:
+        if not isinstance(entry, dict):
+            continue
+        canonical = entry.get("session_id")
+        if not isinstance(canonical, str):
+            continue
+        session_id, harness = normalize_resume_id(canonical)
+        timestamp = entry.get("timestamp")
+        project = entry.get("project")
+        described = [part for part in (harness, project) if isinstance(part, str)]
+        recency = timestamp if isinstance(timestamp, str) else ""
+        existing = matches.get(session_id)
+        if existing is not None and existing.recency >= recency:
+            continue
+        matches[session_id] = SessionMatch(
+            session_id=session_id,
+            harness=harness,
+            recency=recency,
+            label=f"{canonical} ({', '.join(described)})" if described else canonical,
+            indexed=True,
+        )
+    return _ranked(matches.values())
+
+
+def _ranked(matches: Iterable[SessionMatch]) -> list[SessionMatch]:
+    """Newest first, and a session some index knows ahead of one none does.
+
+    A name the archive cannot place is usually a session whose transcript has
+    been pruned; resuming a described session is likelier to reach something.
+    """
+    current = current_session_ids()
+    candidates = [match for match in matches if match.session_id not in current]
+    return sorted(
+        candidates, key=lambda match: (match.indexed, match.recency), reverse=True
+    )
+
+
+def _preferred(matches: list[SessionMatch], agent: str | None) -> list[SessionMatch]:
+    """Matches for the requested agent, or every match when it names none.
+
+    The agent is a preference rather than a filter: a caller that finds a
+    session belonging to another harness can say so, which is more use than
+    reporting no match at all.
+    """
+    if agent is None:
+        return matches
+    preferred = [match for match in matches if match.harness == agent]
+    return preferred or matches
+
+
+def _selected(matches: list[SessionMatch], query: str) -> SessionMatch:
+    """The newest match, reporting the others it was chosen over."""
+    chosen = matches[0]
+    if len(matches) > 1:
+        others = ", ".join(match.label for match in matches[1:4])
+        print(
+            f"agent-model: {len(matches)} sessions match {query!r}; resuming "
+            f"{chosen.label}. Others: {others}. Pass a session id to select one.",
+            file=sys.stderr,
+        )
+    return chosen
+
+
+def resolve_resume_target(query: str, agent: str | None = None) -> SessionMatch | None:
+    """Resolve a --resume argument that is not already a native session id.
+
+    Tried in order of how specific the answer is: an id AgentsView knows, an
+    agent-mail session name, then text from a transcript. Returns None when
+    nothing resolves, leaving the argument to reach the agent as typed.
+    """
+    if not query.strip():
+        return None
+    if not any(character.isspace() for character in query):
+        metadata = session_metadata(query)
+        harness = _metadata_harness(metadata)
+        if metadata is not None:
+            return _described(SessionMatch(query, harness, "", query), metadata)
+
+    named = sessions_named(query)
+    if named:
+        described = _ranked(
+            _described(match, session_metadata(match.session_id))
+            for match in named[:NAME_CANDIDATE_LIMIT]
+        )
+        if described:
+            return _selected(_preferred(described, agent), query)
+
+    contained = sessions_containing(query, agent)
+    if contained:
+        return _selected(_preferred(contained, agent), query)
+    return None
 
 
 def resume_arguments(harness: str, session_id: str | None) -> list[str]:
@@ -347,6 +620,14 @@ def resolve(
     prefixed_harness = None
     if resume_id is not None:
         resume_id, prefixed_harness = normalize_resume_id(resume_id)
+        # A name or a line of transcript text resolves to a native id here, so
+        # everything downstream sees an id the harness can open. An explicit
+        # harness still narrows the search, and still wins the routing below.
+        if prefixed_harness is None and not NATIVE_ID_PATTERN.fullmatch(resume_id):
+            resolved = resolve_resume_target(resume_id, explicit)
+            if resolved is not None:
+                resume_id = resolved.session_id
+                prefixed_harness = resolved.harness
     inferred = (
         prefixed_harness or infer_resume_harness(resume_id)
         if resume_id is not None and explicit is None
@@ -373,11 +654,49 @@ def resolve(
     return invocation, harness
 
 
+def command_resolve_session(arguments: list[str]) -> int:
+    """Print the session id one --resume argument names, and its harness.
+
+    Three lines: the native session id, the harness that owns it, and how that
+    harness spells a resume -- the last two empty when nothing could say. Exit 3
+    means nothing matched, which is a caller's cue to pass the argument through
+    rather than a failure.
+    """
+    agent: str | None = None
+    rest = list(arguments)
+    for index, argument in enumerate(rest):
+        if argument == "--agent":
+            if index + 1 >= len(rest):
+                raise ConfigError("--agent requires an agent name")
+            agent = rest[index + 1]
+            rest = rest[:index] + rest[index + 2 :]
+            break
+        if argument.startswith("--agent="):
+            agent = argument.partition("=")[2]
+            if not agent:
+                raise ConfigError("--agent requires an agent name")
+            rest = rest[:index] + rest[index + 1 :]
+            break
+    if len(rest) != 1:
+        raise ConfigError("resolve-session takes one query")
+    resolved = resolve_resume_target(rest[0], agent)
+    if resolved is None:
+        return 3
+    print(resolved.session_id)
+    print(resolved.harness or "")
+    if resolved.harness is not None:
+        print(shlex.join([resolved.harness, *HARNESS_RESUME_ARGUMENTS[resolved.harness]]))
+    else:
+        print("")
+    return 0
+
+
 def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None:
     print(
         f"""Usage:
-  agent-model launch MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION_ID]] [ARG ...]
-  agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION_ID]] [ARG ...]
+  agent-model launch MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION]] [ARG ...]
+  agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION]] [ARG ...]
+  agent-model resolve-session QUERY [--agent AGENT]
   agent-model default list
   agent-model default get MODEL
   agent-model default set MODEL HARNESS
@@ -388,6 +707,10 @@ def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None
 
 Models: {", ".join(commands)}
 Harness aliases: own, self, and . select the model's native harness.
+
+A SESSION is a session id, an agent-mail session name ("Efficient Deer"), or
+text from the session's transcript. The last two resolve to an id, selecting
+the most recent session when several match.
 
 The harness option is recognized only immediately after MODEL. A bare -h, or
 -h followed by an unknown harness, is forwarded to the selected harness.""",
@@ -494,6 +817,8 @@ def main(arguments: list[str]) -> int:
         raise AssertionError("execvp returned")
     if command == "default":
         return command_default(commands, rest)
+    if command == "resolve-session":
+        return command_resolve_session(rest)
     if command == "config":
         return command_config(commands, rest)
     if command == "doctor":

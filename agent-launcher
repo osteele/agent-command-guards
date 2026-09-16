@@ -383,6 +383,95 @@ if strip_prefixes="$(agentsview_prefixes)"; then
     unset strip_prefix strip_prefixes strip_flags strip_uuid strip_native_re
 fi
 
+# A resume argument that is not a session id at all: an agent-mail session name
+# ("Efficient Deer") or a line remembered from the session's transcript. Both
+# name a session a person can see in a dashboard or a message but cannot paste
+# an id for. launchers/agent-model owns the lookup -- it already resolves ids
+# through AgentsView for the model-first commands, and one implementation means
+# the two entry points cannot disagree about what a name resolves to.
+#
+# Nothing is spent on the common path: the shapes each agent resolves itself
+# are matched here and never reach the lookup.
+AGENT_MODEL="$LAUNCHER_DIR/launchers/agent-model"
+
+resolve_session_argument() {
+    local query="$1" expected="$2" resolved id harness command
+    if [[ ! -x "$AGENT_MODEL" ]]; then
+        printf 'WARN Cannot resolve %s: %s is missing, so it reaches %s as typed\n' \
+            "$query" "$AGENT_MODEL" "$NAME" >&2
+        return 1
+    fi
+    # stderr is deliberately not captured: an ambiguous name reports the
+    # session it chose and the ones it passed over, and that belongs on the
+    # terminal rather than in this substitution.
+    resolved="$("$AGENT_MODEL" resolve-session "$query" --agent "$expected")" || return 1
+    id="$(printf '%s\n' "$resolved" | sed -n 1p)"
+    harness="$(printf '%s\n' "$resolved" | sed -n 2p)"
+    command="$(printf '%s\n' "$resolved" | sed -n 3p)"
+    [[ -n "$id" ]] || return 1
+    if [[ -n "$harness" && "$harness" != "$expected" ]]; then
+        printf 'Error: %s is a %s session, which %s cannot resume. Instead run:\n' \
+            "$query" "$harness" "$NAME" >&2
+        printf '       %s %s\n' "${command:-$harness}" "$id" >&2
+        # Status, not `exit`: this runs inside a command substitution, where an
+        # exit would end only the subshell and let the launch continue. 3 is taken:
+        # agent-model spends it on "nothing matched".
+        return 4
+    fi
+    printf '%s\n' "$id"
+}
+
+if resume_lookup_flags="$(resume_flags)"; then
+    resume_lookup_agent="$(agentsview_prefixes 2>/dev/null || printf '%s' "$NAME")"
+    # agentsview_prefixes pads its single token with spaces for substring
+    # matching; AgentsView wants the bare agent name.
+    resume_lookup_agent="${resume_lookup_agent// /}"
+    lookup_uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    lookup_native_re="^((session_)?${lookup_uuid}|ses_[A-Za-z0-9]{10,})$"
+    lookup_args=("$@")
+    # An empty array is an unbound expansion under `set -u` in bash 3.2, which
+    # is what /bin/bash is on macOS.
+    if [[ ${#lookup_args[@]} -gt 0 ]]; then
+        for lookup_i in "${!lookup_args[@]}"; do
+            lookup_name="${lookup_args[lookup_i]}"
+            lookup_value=""
+            if [[ "$lookup_name" == *=* ]]; then
+                lookup_value="${lookup_name#*=}"
+                lookup_name="${lookup_name%%=*}"
+            fi
+            [[ "$resume_lookup_flags" == *" $lookup_name "* ]] || continue
+            lookup_target="$lookup_i"
+            if [[ -z "$lookup_value" ]]; then
+                lookup_target=$((lookup_i + 1))
+                [[ "$lookup_target" -lt ${#lookup_args[@]} ]] || continue
+                lookup_value="${lookup_args[lookup_target]}"
+            fi
+            # An option, a picker selector such as --last, and an id the agent
+            # already resolves are all left alone.
+            [[ -n "$lookup_value" && "$lookup_value" != -* ]] || continue
+            if [[ "$lookup_value" =~ $lookup_native_re ]]; then
+                continue
+            fi
+            lookup_status=0
+            lookup_resolved="$(resolve_session_argument \
+                "$lookup_value" "$resume_lookup_agent")" || lookup_status=$?
+            if [[ "$lookup_status" -eq 4 ]]; then
+                exit 2
+            fi
+            [[ "$lookup_status" -eq 0 && -n "$lookup_resolved" ]] || continue
+            if [[ "$lookup_target" == "$lookup_i" ]]; then
+                lookup_args[lookup_target]="${lookup_name}=${lookup_resolved}"
+            else
+                lookup_args[lookup_target]="$lookup_resolved"
+            fi
+        done
+        set -- "${lookup_args[@]}"
+    fi
+    unset lookup_args lookup_i lookup_name lookup_value lookup_target
+    unset lookup_resolved lookup_status lookup_uuid lookup_native_re resume_lookup_flags
+    unset resume_lookup_agent
+fi
+
 # A resumed session is the same session. Minting a fresh id for it would give
 # it a new address on every resume, and downstream a new agent-mail name, so
 # prefer the id named on the command line when there is one.
