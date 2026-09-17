@@ -13,6 +13,7 @@ LAUNCHER_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$LAUNCHER_DIR/.." && pwd)"
 LAUNCHER_TARGET="$REPO_DIR/agent-launcher"
 SHADOW_DIR="$REPO_DIR/shadows"
+EPILOGUE_ZSH="$REPO_DIR/shell/epilogue.zsh"
 CONFIG_DIR="$HOME/.config/agent-launchers"
 ENV_FILE="$CONFIG_DIR/env"
 BIN_DIR="${AGENT_LAUNCHER_BIN_DIR:-$HOME/bin}"
@@ -157,6 +158,10 @@ if [[ ! -x "$LAUNCHER_DIR/agent-model" ]]; then
     printf 'Error: %s/agent-model is missing or not executable\n' "$LAUNCHER_DIR" >&2
     exit 1
 fi
+if [[ ! -r "$EPILOGUE_ZSH" ]]; then
+    printf 'Error: %s is missing\n' "$EPILOGUE_ZSH" >&2
+    exit 1
+fi
 
 if $DRY_RUN; then
     printf 'Would create %s and prepend %s to PATH\n' "$ENV_FILE" "$LAUNCHER_DIR"
@@ -220,6 +225,16 @@ agent_guards_restore() {
 }
 agent_guards_restore
 unset -f agent_guards_restore
+
+# The exit-receipt reader. Its producer is the card agent-launcher writes just
+# before it execs the agent; installing only the producer leaves every card
+# unread, and the cards then expire silently a day later.
+#
+# Zsh only: the reader is a precmd hook, and bash has no equivalent that can
+# run after a prompt's status capture without displacing it.
+if [ -n "\${ZSH_VERSION:-}" ] && [ -r "$EPILOGUE_ZSH" ]; then
+    . "$EPILOGUE_ZSH"
+fi
 EOF
     printf 'Generated %s\n' "$ENV_FILE"
     mkdir -p "$BIN_DIR"

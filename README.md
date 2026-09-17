@@ -20,7 +20,8 @@ the `PATH` entry, which meant any file added there became a command in every age
 session, so a helper named `setup` or `check` would have shadowed the real one.
 
 `launchers/` follows the same rule for the agent launchers. `tests/`,
-`agent-launcher`, and the documentation stay off `PATH`.
+`agent-launcher`, `agent-epilogue`, `agent-mail-name`, `shell/`, and the
+documentation stay off `PATH`.
 
 ## Installation
 
@@ -272,6 +273,35 @@ tool, because doing so puts mise's `uv` shim back ahead of the shadows.
   inherits `PATH` directly and does not.
 
 The bridge covers Zsh only. An agent that snapshots Bash would need its own.
+
+### Exit receipts
+
+These agents render on the alternate screen, so exiting restores a scrollback
+with no sign of which session just ended. After a launched agent exits, the next
+shell prompt prints a receipt naming it by its agent-mail name:
+
+```
+┌ llm-performance-models · Flying Cake
+│ 42m · kimi · exited normally
+└ resume  kimi --resume "Flying Cake"
+```
+
+The resume line offers the name rather than a session id. `AGENT_SESSION_ID` is
+the launcher's own bookkeeping and no harness can resolve it; the name resolves
+through the same lookup the launcher's own `--resume` handling uses.
+
+A session that never attached agent-mail has no name, and the receipt renders
+without one. Claude Code prints its own receipt through `claude-wrapper`, which
+names the session the same way.
+
+Set `AGENT_LAUNCHER_NICE`'s neighbour `AGENT_EPILOGUE_DIR` to move the card
+directory (default `~/.cache/agent-command-guards/epilogue`). Nested launches —
+an agent started inside another agent's session — write no card, so one terminal
+never overwrites the receipt another agent is waiting to print.
+
+The reader is a Zsh `precmd` hook installed by `launchers/setup` into
+`~/.config/agent-launchers/env`. Bash gets no receipt: there is no equivalent
+hook that can run after the prompt captures its status without displacing it.
 
 ## Commands
 

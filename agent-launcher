@@ -16,6 +16,19 @@ DEFAULT_SHADOW_DIR="$LAUNCHER_DIR/shadows"
 SHADOW_DIR="${AGENT_LAUNCHER_PREPEND_PATH:-$DEFAULT_SHADOW_DIR}"
 SHELL_INIT_DIR="$LAUNCHER_DIR/launchers/shell-init"
 
+# Whether this launch is nested inside another agent's session. Captured here,
+# from the environment as it arrived: the markers below are reset further down
+# for the agent this launcher is about to start, and by then the question can
+# no longer be asked. A nested agent must not leave an exit card, because the
+# card is keyed by terminal and the outer agent's card is the one the person
+# is waiting to read.
+NESTED_LAUNCH=false
+if [[ -n "${AGENT_COMMAND_GUARDS_ACTIVE:-}" || -n "${CLAUDECODE:-}" \
+      || -n "${CLAUDE_CODE_SESSION_ID:-}" || -n "${AGENT_SESSION_ID:-}" \
+      || -n "${GEMINI_CLI:-}" ]]; then
+    NESTED_LAUNCH=true
+fi
+
 if [[ "$NAME" == "agent-launcher" ]]; then
     printf 'Error: run %s through an agent-named symlink, not directly\n' \
         "$SCRIPT_PATH" >&2
@@ -534,5 +547,43 @@ fi
 # inherit niceness). `nice` only arbitrates contention: on idle cores the agent
 # runs at full speed, and under load the user's interactive work wins. `nice`
 # execs the target in place, so $$ and AGENT_SESSION_PID still name the agent.
+# Leave the shell a card to render once this session ends.
+#
+# `exec` below means there is no code of ours left to print anything, so the
+# summary is produced at the next shell prompt instead (shell/epilogue.zsh),
+# which is also the only place the exit status can be observed. The card
+# carries what is knowable now; the readable agent-mail name is not, since
+# agent-mail mints it seconds later, so agent-epilogue resolves it at print
+# time from the session id and this process's pid.
+#
+# One argument per line, consumed verbatim as agent-epilogue's argv: a format
+# with no quoting rules cannot disagree with its reader about them.
+if [[ "$NESTED_LAUNCH" == false && -t 1 ]]; then
+    epilogue_dir="${AGENT_EPILOGUE_DIR:-$HOME/.cache/agent-command-guards/epilogue}"
+    epilogue_key="${TERM_SESSION_ID:-}"
+    [[ -z "$epilogue_key" ]] && epilogue_key="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' /')"
+    [[ -z "$epilogue_key" ]] && epilogue_key="default"
+    epilogue_key="$(printf '%s' "$epilogue_key" | tr -c 'A-Za-z0-9._-' '_')"
+    if mkdir -p "$epilogue_dir" 2>/dev/null; then
+        # A session whose terminal never reaches another prompt -- a closed tab
+        # -- would otherwise leave its card behind forever.
+        find "$epilogue_dir" -type f -mtime +1 -delete 2>/dev/null || true
+        epilogue_tmp="$epilogue_dir/.$epilogue_key.$$.tmp"
+        if printf '%s\n' \
+            --harness "$NAME" \
+            --cwd "$PWD" \
+            --session-id "$AGENT_SESSION_ID" \
+            --host-pid "$$" \
+            --started "$(date +%s)" \
+            --recorded-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$epilogue_tmp" 2>/dev/null; then
+            mv -f "$epilogue_tmp" "$epilogue_dir/$epilogue_key.card" 2>/dev/null || \
+                rm -f "$epilogue_tmp"
+        else
+            rm -f "$epilogue_tmp"
+        fi
+    fi
+fi
+
 NICENESS="${AGENT_LAUNCHER_NICE:-5}"
 exec nice -n "$NICENESS" "$REAL_BINARY" "$@"

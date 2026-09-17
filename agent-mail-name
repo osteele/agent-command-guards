@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Resolve a session's readable agent-mail name ("Flying Cake").
+
+agent-mail mints one name per session and keeps it in a durable store keyed by
+the sha256 of the session id. The name outlives the session: the store is never
+pruned, which is what makes it readable from an exit path that runs after the
+agent is gone.
+
+Two ways to ask, because the id agent-mail keyed on is not always the id a
+launcher knows. agent-mail resolves its session id from CLAUDE_CODE_SESSION_ID,
+then CODEX_THREAD_ID, then the launcher-minted AGENT_SESSION_ID -- so for Codex
+the thread id wins and a launcher's own id finds nothing. `--host-pid` asks the
+question the other way round: which session belonged to this agent process.
+
+Exit 3 means no name, which is not an error. A session that never attached
+agent-mail never had one, and that must never be what breaks an exit receipt.
+
+Not on PATH: reached by absolute path from agent-epilogue and the launcher.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".claude" / "agent-mail"
+SESSION_NAMES_DIR = STATE_DIR / "session-names"
+# Written by agent-mail's channel server at startup, keyed by the host agent's
+# pid. Authoritative where a hash of a launcher id only guesses: the channel
+# records the id it actually resolved.
+BREADCRUMB_DIR = SESSION_NAMES_DIR / "by-host-pid"
+REGISTRY_DIR = STATE_DIR / "registry"
+
+NO_NAME = 3
+
+
+def _load(path: Path) -> dict[str, object] | None:
+    """Parse one JSON record, or None. Absent, unreadable, and malformed are
+    all the same answer here: this cannot be the thing that fails."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _display_name(record: dict[str, object]) -> str | None:
+    for key in ("displayName", "slug"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def name_for_session(session_id: str, directory: Path = SESSION_NAMES_DIR) -> str | None:
+    """The stored name for `session_id`, by the store's own key derivation."""
+    if not session_id:
+        return None
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    record = _load(directory / f"{digest}.json")
+    return _display_name(record) if record else None
+
+
+def _breadcrumb(host_pid: int, directory: Path = BREADCRUMB_DIR) -> dict[str, object] | None:
+    return _load(directory / f"{host_pid}.json")
+
+
+def _to_second(timestamp: str) -> str:
+    """An ISO timestamp truncated to the second, for ordering two of them.
+
+    The two sides are written by different programs: agent-mail records
+    milliseconds, the launcher does not, and "17.630Z" sorts *below* "17Z"
+    because "." precedes "Z". Comparing whole seconds is what the two spellings
+    actually agree on, and a breadcrumb written in the same second as the
+    launch is not stale.
+    """
+    head, _, _ = timestamp.partition(".")
+    return head.rstrip("Z")
+
+
+def _registry_session(host_pid: int, directory: Path = REGISTRY_DIR) -> str | None:
+    """The session id of a live agent-mail server whose host is `host_pid`.
+
+    Registry entries are pruned when the server exits, so this answers only
+    while the session is still running. It is the fallback for a session that
+    started before agent-mail began leaving breadcrumbs.
+    """
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.suffix != ".json":
+            continue
+        record = _load(entry)
+        if record is None:
+            continue
+        if record.get("parentPid") != host_pid:
+            continue
+        session_id = record.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
+
+
+def name_for_host_pid(
+    host_pid: int,
+    *,
+    not_before: str | None = None,
+    breadcrumbs: Path = BREADCRUMB_DIR,
+    registry: Path = REGISTRY_DIR,
+    store: Path = SESSION_NAMES_DIR,
+) -> str | None:
+    """The name of the session that ran under agent process `host_pid`.
+
+    `not_before` is an ISO timestamp the breadcrumb must not predate. Pids are
+    reused, and a breadcrumb left by an earlier process with the same pid would
+    otherwise put a stranger's name on this receipt.
+    """
+    record = _breadcrumb(host_pid, breadcrumbs)
+    if record is not None:
+        recorded = record.get("recordedAt")
+        stale = (
+            not_before is not None
+            and isinstance(recorded, str)
+            and _to_second(recorded) < _to_second(not_before)
+        )
+        if not stale:
+            name = _display_name(record)
+            if name:
+                return name
+            session_id = record.get("sessionId")
+            if isinstance(session_id, str):
+                resolved = name_for_session(session_id, store)
+                if resolved:
+                    return resolved
+    session_id = _registry_session(host_pid, registry)
+    return name_for_session(session_id, store) if session_id else None
+
+
+def main(argv: list[str]) -> int:
+    session_id: str | None = None
+    host_pid: int | None = None
+    not_before: str | None = None
+    arguments = list(argv)
+    while arguments:
+        argument = arguments.pop(0)
+        if argument == "--session-id" and arguments:
+            session_id = arguments.pop(0)
+        elif argument == "--host-pid" and arguments:
+            value = arguments.pop(0)
+            if not value.isdigit():
+                print(f"agent-mail-name: not a pid: {value}", file=sys.stderr)
+                return 2
+            host_pid = int(value)
+        elif argument == "--not-before" and arguments:
+            not_before = arguments.pop(0)
+        elif argument in ("--help", "-h"):
+            print(__doc__.strip(), file=sys.stderr)
+            return 0
+        else:
+            print(f"agent-mail-name: unexpected argument: {argument}", file=sys.stderr)
+            return 2
+
+    name: str | None = None
+    if session_id:
+        name = name_for_session(session_id)
+    if name is None and host_pid is not None:
+        name = name_for_host_pid(host_pid, not_before=not_before)
+    if name is None:
+        return NO_NAME
+    print(name)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

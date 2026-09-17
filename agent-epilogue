@@ -1,0 +1,123 @@
+#!/bin/bash
+#
+# Render a one-line-tall summary of a launcher-served agent session (kimi,
+# opencode, codex, omp, agy), naming it by its readable agent-mail name.
+#
+# These agents run on the alternate screen, exactly as Claude Code does, so
+# their exit restores a scrollback that says nothing about what just ran. The
+# launcher cannot render this itself: it `exec`s the agent and is gone by the
+# time there is anything to report. So the launcher leaves a card of what it
+# knew at launch and the shell renders it at the next prompt -- the first
+# moment the main screen is back, and the only place the exit status is
+# visible. See shell/epilogue.zsh.
+#
+# The agent-mail name is resolved here rather than recorded in the card,
+# because at launch there is no name yet: agent-mail mints it seconds later,
+# when the agent starts its channel server.
+#
+# Usage: agent-epilogue --harness NAME [--cwd DIR] [--session-id ID]
+#                       [--host-pid PID] [--started EPOCH] [--status N]
+
+set -uo pipefail
+
+SCRIPT_PATH="$(realpath "$0")"
+REPO_DIR="$(dirname "$SCRIPT_PATH")"
+
+harness="" cwd="" session_id="" host_pid="" started="" status="" recorded_at=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --harness)     harness="${2:-}";     shift 2 ;;
+        --cwd)         cwd="${2:-}";         shift 2 ;;
+        --session-id)  session_id="${2:-}";  shift 2 ;;
+        --host-pid)    host_pid="${2:-}";    shift 2 ;;
+        --started)     started="${2:-}";     shift 2 ;;
+        --status)      status="${2:-}";      shift 2 ;;
+        --recorded-at) recorded_at="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+[[ -n "$harness" ]] || exit 2
+
+C_RAIL=$'\033[38;5;173m'
+C_DIM=$'\033[2m'
+C_BOLD=$'\033[1m'
+C_RESET=$'\033[0m'
+
+# ---- the name ---------------------------------------------------------------
+# Both lookups are offered because the id agent-mail keyed on depends on the
+# harness: Codex exports a thread id that outranks the launcher's, so only the
+# host pid finds it. Exit 3 means the session never attached agent-mail, which
+# is ordinary -- the block just goes out without a name.
+name=""
+if [[ -x "$REPO_DIR/agent-mail-name" ]]; then
+    lookup=(--session-id "$session_id")
+    [[ -n "$host_pid" ]] && lookup+=(--host-pid "$host_pid")
+    [[ -n "$recorded_at" ]] && lookup+=(--not-before "$recorded_at")
+    name="$("$REPO_DIR/agent-mail-name" "${lookup[@]}" 2>/dev/null)" || name=""
+fi
+
+# ---- how it ended -----------------------------------------------------------
+# Unlike Claude Code, these harnesses fire no end-of-session hook, so the exit
+# status the shell observed is the only account of how the session finished.
+ended="exited normally"
+if [[ -n "$status" && "$status" != "0" ]]; then
+    if [[ "$status" -gt 128 ]]; then
+        sig=$((status - 128))
+        case "$sig" in
+            2)  ended="interrupted (Ctrl-C)" ;;
+            9)  ended="killed (SIGKILL)" ;;
+            15) ended="terminated (SIGTERM)" ;;
+            *)  ended="killed by signal $sig" ;;
+        esac
+    else
+        ended="crashed (status $status)"
+    fi
+fi
+
+# ---- duration ---------------------------------------------------------------
+duration=""
+if [[ "$started" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"
+    if [[ "$now" -ge "$started" ]]; then
+        d=$((now - started)) h=$(( (now - started) / 3600 )) m=$(( ((now - started) % 3600) / 60 ))
+        if   [[ $h -gt 0 ]]; then duration="${h}h${m}m"
+        elif [[ $m -gt 0 ]]; then duration="${m}m"
+        else duration="${d}s"; fi
+    fi
+fi
+
+# ---- assemble ---------------------------------------------------------------
+project="${cwd##*/}"
+[[ -z "$project" ]] && project="?"
+
+subject="$name"
+[[ -z "$subject" ]] && subject="(unnamed session)"
+
+facts="$harness · $ended"
+[[ -n "$duration" ]] && facts="${duration} · $facts"
+
+printf '%s┌%s %s%s%s %s·%s %s\n' \
+    "$C_RAIL" "$C_RESET" "$C_BOLD" "$project" "$C_RESET" "$C_DIM" "$C_RESET" "$subject"
+printf '%s│%s %s%s%s\n' "$C_RAIL" "$C_RESET" "$C_DIM" "$facts" "$C_RESET"
+
+# The name, not the id, is what resumes these. The launcher mints
+# AGENT_SESSION_ID for its own bookkeeping; the harness has never heard of it
+# and resolves only its own native id, so printing it would offer a command
+# that fails. The name resolves through agent-model's session lookup, which is
+# what the launcher's own --resume handling already calls.
+resume_flag=""
+case "$harness" in
+    kimi|omp)  resume_flag="--resume" ;;
+    codex)     resume_flag="resume" ;;
+    opencode)  resume_flag="--session" ;;
+    agy)       resume_flag="--conversation" ;;
+esac
+
+if [[ -n "$name" && -n "$resume_flag" ]]; then
+    printf '%s└%s %sresume%s  %s %s "%s"\n' \
+        "$C_RAIL" "$C_RESET" "$C_DIM" "$C_RESET" "$harness" "$resume_flag" "$name"
+else
+    printf '%s└%s\n' "$C_RAIL" "$C_RESET"
+fi

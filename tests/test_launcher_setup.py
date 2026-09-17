@@ -141,6 +141,16 @@ class LauncherSetupTest(unittest.TestCase):
             self.assertEqual((self.home / name).read_text().count(BLOCK_START), 1)
             self.assertEqual((self.home / name).read_text().count(BLOCK_END), 1)
 
+    def test_env_file_installs_the_exit_receipt_reader(self) -> None:
+        # The launcher's card is written just before it execs the agent, and
+        # nothing else reads it. Installing the producer without this reader
+        # leaves every card unread until it expires a day later.
+        self.seed_rc_files()
+        self.assertEqual(self.run_setup().returncode, 0)
+        env = (self.home / ".config" / "agent-launchers" / "env").read_text()
+        self.assertIn("shell/epilogue.zsh", env)
+        self.assertIn("ZSH_VERSION", env)
+
     def test_install_upgrades_an_existing_source_only_block(self) -> None:
         self.seed_rc_files()
         for name in RC_FILES:
