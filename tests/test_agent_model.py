@@ -519,6 +519,56 @@ class AgentModelTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), f"opencode --session {session_id}")
         self.assertFalse(witness.exists(), witness.read_text() if witness.exists() else "")
 
+    def write_claude_transcript(self, session_id: str, project: str = "p") -> Path:
+        """A transcript file named after the session, as `--resume` expects."""
+        directory = self.home / ".claude" / "projects" / project
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{session_id}.jsonl"
+        path.write_text("{}\n")
+        return path
+
+    def test_a_name_whose_session_no_longer_opens_resolves_to_nothing(self) -> None:
+        # Claude Code mints a fresh id for each run of a resumed conversation
+        # and appends to the original transcript, so the run's id names no
+        # file. agent-mail named that run, so its name outlives the only id it
+        # points at -- and resuming it answered "No conversation found".
+        session_id = "b1e9a6a9-3d14-41a4-86c9-d7ad9c91cb10"
+        self.write_session_name(session_id, "Nutritious Cucumber")
+        self.install_agentsview_router()
+        result = self.run_model("resolve-session", "Nutritious Cucumber")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_a_named_session_with_a_transcript_costs_one_lookup(self) -> None:
+        # The transcript answers "can this be resumed" locally, so the only
+        # remaining AgentsView call is the one that describes the match.
+        # AgentsView answers a hit in milliseconds but concludes a miss only
+        # after scanning its archive, which is where the launch-time timeouts
+        # came from -- the check that must not reach it is the placement one.
+        session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
+        self.write_session_name(session_id, "Efficient Deer")
+        self.write_claude_transcript(session_id)
+        witness = self.tmp / "agentsview-calls"
+        self.install_agentsview_router({session_id: "claude"}, witness=witness)
+        result = self.run_model("resolve-session", "Efficient Deer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], session_id)
+        calls = witness.read_text().splitlines() if witness.exists() else []
+        gets = [call for call in calls if call.startswith(f"session get {session_id}")]
+        self.assertEqual(len(gets), 1, calls)
+
+    def test_an_unreachable_agentsview_does_not_discard_a_named_session(self) -> None:
+        # Silence is not evidence of absence: an AgentsView that is down, hung,
+        # or missing would otherwise turn every name into "no such session".
+        session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
+        self.write_session_name(session_id, "Efficient Deer")
+        broken = self.bin_dir / "agentsview"
+        broken.write_text("#!/bin/sh\necho 'boom' >&2\nexit 1\n")
+        broken.chmod(0o755)
+        result = self.run_model("resolve-session", "Efficient Deer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], session_id)
+
     def test_resolve_session_reports_the_id_harness_and_resume_spelling(self) -> None:
         session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
         self.write_session_name(session_id, "Efficient Deer")

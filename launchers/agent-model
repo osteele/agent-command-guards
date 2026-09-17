@@ -320,9 +320,22 @@ def _agentsview_json(arguments: list[str], timeout: float = 10.0) -> object | No
     the query failing, and output that is not JSON. A miss is not an error here
     — the caller has other ways to resolve the same value.
     """
+    return _agentsview_query(arguments, timeout)[0]
+
+
+def _agentsview_query(
+    arguments: list[str], timeout: float = 10.0
+) -> tuple[object | None, bool]:
+    """The parsed JSON, and whether AgentsView actually answered.
+
+    Callers that treat a missing record as evidence need the second value: an
+    uninstalled, hung, or erroring AgentsView returns no record either, and
+    reading that as "this session does not exist" turns an outage into a
+    confident wrong answer.
+    """
     agentsview = shutil.which("agentsview")
     if agentsview is None:
-        return None
+        return None, False
     try:
         result = subprocess.run(
             [agentsview, *arguments, "--json"],
@@ -333,14 +346,16 @@ def _agentsview_json(arguments: list[str], timeout: float = 10.0) -> object | No
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"agent-model: AgentsView lookup failed: {error}", file=sys.stderr)
-        return None
+        return None, False
     if result.returncode != 0:
-        return None
+        # A query AgentsView ran and answered negatively. "not found" is an
+        # answer; anything else is the tool failing to answer at all.
+        return None, "not found" in result.stderr.casefold()
     try:
-        return json.loads(result.stdout)
+        return json.loads(result.stdout), True
     except json.JSONDecodeError as error:
         print(f"agent-model: AgentsView returned invalid JSON: {error}", file=sys.stderr)
-        return None
+        return None, False
 
 
 def session_metadata(session_id: str) -> dict[str, object] | None:
@@ -534,6 +549,50 @@ def sessions_containing(query: str, agent: str | None = None) -> list[SessionMat
     return _ranked(matches.values())
 
 
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def claude_transcript_exists(
+    session_id: str, directory: Path = CLAUDE_PROJECTS_DIR
+) -> bool:
+    """Whether a Claude Code transcript is named after this session id.
+
+    This is the resumability test for a Claude session: `--resume` opens the
+    file named after the id, so a missing file is a missing conversation.
+
+    Local and instant, which is why it is asked first. AgentsView answers a hit
+    in ~0.1s but concludes a miss only after scanning its whole archive -- 16s
+    on this machine, which is where the launch-time timeouts came from.
+    """
+    if not session_id:
+        return False
+    try:
+        return any(directory.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return False
+
+
+def _resumable(match: SessionMatch) -> bool:
+    """Whether resuming this match could reach a conversation.
+
+    A name can resolve to an id that no longer opens anything. Claude Code
+    mints a fresh session id for each *run* of a resumed conversation and
+    appends to the original transcript, so the run's id names no file --
+    agent-mail still named that run, so its name lives in the store pointing at
+    an id `--resume` answers "No conversation found with session ID" for.
+
+    Dropped only on evidence. An AgentsView that did not answer proves nothing,
+    and reading its silence as absence would turn an outage into a confident
+    wrong answer.
+    """
+    if claude_transcript_exists(match.session_id):
+        return True
+    record, answered = _agentsview_query(["session", "get", match.session_id])
+    if record is not None:
+        return True
+    return not answered
+
+
 def _ranked(matches: Iterable[SessionMatch]) -> list[SessionMatch]:
     """Newest first, and a session some index knows ahead of one none does.
 
@@ -593,6 +652,7 @@ def resolve_resume_target(query: str, agent: str | None = None) -> SessionMatch 
         described = _ranked(
             _described(match, session_metadata(match.session_id))
             for match in named[:NAME_CANDIDATE_LIMIT]
+            if _resumable(match)
         )
         if described:
             return _selected(_preferred(described, agent), query)
