@@ -367,13 +367,26 @@ class AgentModelTest(unittest.TestCase):
         sessions: dict[str, str] | None = None,
         found: list[tuple[str, str]] | None = None,
         witness: Path | None = None,
+        indexed: list[tuple[str, str, str]] | None = None,
     ) -> None:
         """A fake AgentsView: `sessions` maps id to agent, `found` is a search.
 
         Each entry of `found` is one (canonical id, timestamp) the transcript
-        search reports. `witness` records every call, so a test can assert the
-        lookup was never reached at all.
+        search reports. Each entry of `indexed` is one (canonical id,
+        started_at, cwd) that `session list` reports -- the sessions a name
+        recorded against a launcher-minted id is joined against. `witness`
+        records every call, so a test can assert the lookup was never reached at
+        all.
         """
+        listed = json.dumps(
+            {
+                "sessions": [
+                    {"id": canonical, "started_at": started, "cwd": cwd, "agent": canonical.split(":", 1)[0]}
+                    for canonical, started, cwd in (indexed or [])
+                ],
+                "total": len(indexed or []),
+            }
+        )
         metadata = {
             session_id: json.dumps(
                 {"id": session_id, "agent": agent, "project": "p", "started_at": "2026-09-01T00:00:00Z"}
@@ -405,6 +418,7 @@ class AgentModelTest(unittest.TestCase):
         script.append('      *) echo "fatal: session $3 not found" >&2; exit 1 ;;')
         script.append("    esac ;;")
         script.append(f"  search) printf '%s' '{matches}' ;;")
+        script.append(f"  list) printf '%s' '{listed}' ;;")
         script.append("  *) exit 1 ;;")
         script.append("esac")
         path = self.bin_dir / "agentsview"
@@ -539,12 +553,12 @@ class AgentModelTest(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertEqual(result.stdout.strip(), "")
 
-    def test_a_named_session_with_a_transcript_costs_one_lookup(self) -> None:
-        # The transcript answers "can this be resumed" locally, so the only
-        # remaining AgentsView call is the one that describes the match.
-        # AgentsView answers a hit in milliseconds but concludes a miss only
-        # after scanning its archive, which is where the launch-time timeouts
-        # came from -- the check that must not reach it is the placement one.
+    def test_a_named_session_with_a_transcript_costs_no_lookup(self) -> None:
+        # A transcript in the harness's own store answers both questions a match
+        # raises -- that it opens, and which harness opens it -- so a resume
+        # whose id is already native never reaches AgentsView at all. AgentsView
+        # answers a hit in milliseconds but concludes a miss only after scanning
+        # its archive, which is where the launch-time timeouts came from.
         session_id = "9a1d4f7c-2b6e-4c11-9f3a-5d8e0c2b7a44"
         self.write_session_name(session_id, "Efficient Deer")
         self.write_claude_transcript(session_id)
@@ -552,10 +566,125 @@ class AgentModelTest(unittest.TestCase):
         self.install_agentsview_router({session_id: "claude"}, witness=witness)
         result = self.run_model("resolve-session", "Efficient Deer")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[0], session_id)
+        self.assertEqual(
+            result.stdout.splitlines(), [session_id, "claude", "claude --resume"]
+        )
         calls = witness.read_text().splitlines() if witness.exists() else []
-        gets = [call for call in calls if call.startswith(f"session get {session_id}")]
-        self.assertEqual(len(gets), 1, calls)
+        self.assertEqual(calls, [])
+
+    def write_announced(self, session_id: str, project: str) -> Path:
+        """agent-mail's announcement record, where a session's cwd outlives it."""
+        directory = self.home / ".claude" / "agent-mail" / "announced"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"typeset-viewer-67c7ac162c-{session_id}.json"
+        path.write_text(
+            json.dumps({"version": 1, "sessionId": session_id, "project": project})
+        )
+        return path
+
+    # A name minted against the launcher's own id. Uppercase because uuidgen
+    # uppercases and every harness's native id is lowercase, but nothing reads
+    # the case -- what makes it unresumable is that no harness store holds it.
+    LAUNCHER_ID = "EE1E8456-295B-4BE5-AB37-06D3FC268E8C"
+
+    def test_a_name_recorded_against_the_launcher_id_resolves_to_the_native_one(
+        self,
+    ) -> None:
+        # omp, kimi, opencode and agy export no session id of their own, so
+        # agent-mail names them against AGENT_SESSION_ID -- which no harness
+        # resolves. The session AgentsView indexed is the one that opens.
+        self.write_session_name(
+            self.LAUNCHER_ID, "Gifted Bowl", assigned_at="2026-09-18T00:40:01.720Z"
+        )
+        witness = self.tmp / "agentsview-calls"
+        self.install_agentsview_router(
+            witness=witness,
+            indexed=[
+                (
+                    "omp:01a0b1f4-bbdc-7644-a647-893ee1addcec",
+                    "2026-09-18T00:40:01.244Z",
+                    "/w/typeset-viewer",
+                )
+            ],
+        )
+        result = self.run_model("resolve-session", "Gifted Bowl", "--agent", "omp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["01a0b1f4-bbdc-7644-a647-893ee1addcec", "omp", "omp --resume"],
+        )
+        # The join replaces the `session get` that spends ~16s concluding the
+        # launcher's id is unknown; it must not also be paid.
+        calls = witness.read_text().splitlines() if witness.exists() else []
+        self.assertEqual([call.split()[1] for call in calls], ["list"], calls)
+
+    def test_the_recorded_cwd_rejects_a_session_the_clock_alone_would_accept(
+        self,
+    ) -> None:
+        self.write_session_name(
+            self.LAUNCHER_ID, "Gifted Bowl", assigned_at="2026-09-18T00:40:01.720Z"
+        )
+        self.write_announced(self.LAUNCHER_ID, "/w/typeset-viewer")
+        self.install_agentsview_router(
+            indexed=[
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addcec", "2026-09-18T00:40:01.244Z", "/w/elsewhere"),
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addced", "2026-09-18T00:40:02.000Z", "/w/typeset-viewer"),
+            ],
+        )
+        result = self.run_model("resolve-session", "Gifted Bowl", "--agent", "omp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines()[0], "01a0b1f4-bbdc-7644-a647-893ee1addced"
+        )
+
+    def test_an_ambiguous_join_resolves_to_nothing_rather_than_guessing(self) -> None:
+        # Two sessions inside the window and no recorded directory to separate
+        # them. An ambiguous cross-system join is never reported as authoritative.
+        self.write_session_name(
+            self.LAUNCHER_ID, "Gifted Bowl", assigned_at="2026-09-18T00:40:01.720Z"
+        )
+        self.install_agentsview_router(
+            indexed=[
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addcec", "2026-09-18T00:40:01.244Z", "/w/one"),
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addced", "2026-09-18T00:40:03.000Z", "/w/two"),
+            ],
+        )
+        result = self.run_model("resolve-session", "Gifted Bowl", "--agent", "omp")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertIn("not guessing", result.stderr)
+
+    def test_a_session_outside_the_window_is_not_joined(self) -> None:
+        self.write_session_name(
+            self.LAUNCHER_ID, "Gifted Bowl", assigned_at="2026-09-18T00:40:01.720Z"
+        )
+        self.install_agentsview_router(
+            indexed=[
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addcec", "2026-09-18T03:41:59Z", "/w/typeset-viewer")
+            ],
+        )
+        result = self.run_model("resolve-session", "Gifted Bowl", "--agent", "omp")
+        self.assertEqual(result.returncode, 3)
+
+    def test_a_malformed_announced_record_falls_back_to_the_window(self) -> None:
+        # Another tool's private state: absent, unreadable and malformed records
+        # are all "no extra evidence", never the thing that stops a launch.
+        self.write_session_name(
+            self.LAUNCHER_ID, "Gifted Bowl", assigned_at="2026-09-18T00:40:01.720Z"
+        )
+        directory = self.home / ".claude" / "agent-mail" / "announced"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"x-{self.LAUNCHER_ID}.json").write_text("{not json")
+        self.install_agentsview_router(
+            indexed=[
+                ("omp:01a0b1f4-bbdc-7644-a647-893ee1addcec", "2026-09-18T00:40:01.244Z", "/w/typeset-viewer")
+            ],
+        )
+        result = self.run_model("resolve-session", "Gifted Bowl", "--agent", "omp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines()[0], "01a0b1f4-bbdc-7644-a647-893ee1addcec"
+        )
 
     def test_an_unreachable_agentsview_does_not_discard_a_named_session(self) -> None:
         # Silence is not evidence of absence: an AgentsView that is down, hung,
