@@ -553,15 +553,22 @@ def sessions_containing(query: str, agent: str | None = None) -> list[SessionMat
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Where each harness keeps the transcripts it can reopen, as a glob over the
-# session id. A hit is proof that the id opens something *and* names the harness
-# that owns it -- both of the answers AgentsView is otherwise asked for, for the
-# cost of a readdir.
+# session id. The file *is* the resumability test: a resume opens the transcript
+# named after the id, so a hit proves the id opens something and names the
+# harness that owns it -- both of the answers AgentsView is otherwise asked for,
+# for the cost of a readdir.
 #
 # Asked before AgentsView because a miss there costs ~16s: it concludes absence
 # only after scanning its whole archive, which is where the launch-time timeouts
 # came from. opencode is absent deliberately -- it keeps no transcript store to
 # glob, and its `ses_` ids are native shapes that resolve without ever reaching
 # here.
+#
+# The layouts are another tool's, and this repository cannot prove them; each was
+# read off this machine's stores on 2026-09-18. A pattern that goes wrong when
+# one of them changes costs a lookup rather than an answer: it degrades to the
+# AgentsView path that ran before, because a hit still requires the id to appear
+# in that harness's own store.
 LOCAL_SESSION_STORES: dict[str, tuple[Path, str]] = {
     "claude": (CLAUDE_PROJECTS_DIR, "*/{session_id}.jsonl"),
     "omp": (Path.home() / ".omp" / "agent" / "sessions", "*/*_{session_id}.jsonl"),
@@ -582,22 +589,6 @@ def local_store_harness(
         except OSError:
             continue
     return None
-
-
-def claude_transcript_exists(
-    session_id: str, directory: Path = CLAUDE_PROJECTS_DIR
-) -> bool:
-    """Whether a Claude Code transcript is named after this session id.
-
-    This is the resumability test for a Claude session: `--resume` opens the
-    file named after the id, so a missing file is a missing conversation.
-    """
-    if not session_id:
-        return False
-    try:
-        return any(directory.glob(f"*/{session_id}.jsonl"))
-    except OSError:
-        return False
 
 
 # agent-mail's per-session announcement records: the one durable place the
