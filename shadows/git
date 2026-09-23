@@ -333,14 +333,28 @@ if [[ "$SUBCMD" == "commit" ]]; then
     if jj_root="$(find_guarded_jj_root)"; then
         local_args=()
         amend=false
-        for arg in ${SUBCMD_ARGS[@]+"${SUBCMD_ARGS[@]}"}; do
+        set -- ${SUBCMD_ARGS[@]+"${SUBCMD_ARGS[@]}"}
+        while (( $# )); do
+            arg="$1"
+            shift
             case "$arg" in
                 --amend) amend=true ;;
-                # Flags that jj commit/describe also accepts
-                -m|--message|-m=*|--message=*) local_args+=("$arg") ;;
-                # Skip git-only flags: -a, --all, -p, --patch, etc.
+                -m|--message)
+                    # Join the value so jj accepts messages beginning with "-".
+                    if (( $# )); then
+                        local_args+=("--message=$1")
+                        shift
+                    else
+                        local_args+=("$arg")
+                    fi
+                    ;;
+                -m=*|--message=*) local_args+=("$arg") ;;
+                # Skip Git-only flags, but never reinterpret their message values.
                 -a|--all|-p|--patch|--allow-empty|--no-edit) ;;
-                # Pass through anything else (e.g. the message after -m)
+                --)
+                    local_args+=("--" "$@")
+                    break
+                    ;;
                 *) local_args+=("$arg") ;;
             esac
         done
@@ -415,6 +429,15 @@ handle_worktree() {
             if [[ "$candidate_path" != /* ]]; then
                 candidate_path="$GIT_SEARCH_DIR/$candidate_path"
             fi
+            # Directory suffixes make -L follow a symlink instead of testing it.
+            while [[ "$candidate_path" != "/" ]]; do
+                case "$candidate_path" in
+                    */) candidate_path="${candidate_path%/}" ;;
+                    */.) candidate_path="${candidate_path%/.}" ;;
+                    *) break ;;
+                esac
+            done
+            candidate_path="${candidate_path:-/}"
             if [[ -L "$candidate_path" ]]; then
                 echo "git shadow: refusing to remove a workspace through a symbolic link: $path" >&2
                 exit 1

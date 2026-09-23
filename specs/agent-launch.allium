@@ -1,0 +1,443 @@
+-- allium: 3
+-- Scope: Agent launch, conversation selection for resume, and exit receipts.
+-- Includes: Model/harness selection, interactive and unattended resume, receipts.
+-- Excludes: Installation, harness internals, transcript indexing, credential storage,
+-- and command execution policy (specified in command-guards.allium).
+-- Authority: Elicitation on 2026-09-23. Sections labeled baseline retain documented
+-- behavior from README.md; these specifications do not assert implementation parity.
+
+external entity Caller {}
+
+-- The interactive shell supplies process-exit and prompt-return observations.
+external entity Shell {}
+
+external entity Harness {
+    name: String
+}
+
+external entity LaunchRequest {
+    caller: Caller
+    model: String
+    requested_harness: Harness?
+    default_harness: Harness
+    project: String
+    interactive: Boolean
+    nested: Boolean
+}
+
+external entity Conversation {
+    native_id: String
+    harness: Harness
+}
+
+external entity ResumeRequest {
+    launch: LaunchRequest
+    query: String
+    -- Present only when the caller supplied an exact native identifier.
+    exact_native_id: String?
+    -- Harness selected for this invocation before conversation lookup.
+    invocation_harness: Harness
+    current_conversation: Conversation?
+}
+
+-- Resolution is an external boundary, not a scan of another tool's private state.
+-- matches is ordered newest-first by the resolver's recency policy, contains each
+-- conversation once, and excludes the conversation doing the asking.
+external entity Resolution {
+    request: ResumeRequest
+    matches: List<Conversation>
+    conclusive: Boolean
+
+    preferred: matches where harness = request.launch.requested_harness
+    has_newer_other_harness: matches.count > 0 and preferred.count > 0 and
+        matches.first.harness != request.launch.requested_harness
+}
+
+external entity CompletedRun {
+    launch: LaunchRequest
+    actual_harness: Harness
+    session_name: String?
+    verified_native_id: String?
+    elapsed: Duration
+    exit_status: Integer
+}
+
+entity ResumeSelection {
+    resolution: Resolution
+    conversation: Conversation
+    automatic: Boolean
+    alternatives: Set<Conversation>
+}
+
+entity ResumePrompt {
+    resolution: Resolution
+    status: awaiting_selection | selected | cancelled
+
+    transitions status {
+        awaiting_selection -> selected
+        awaiting_selection -> cancelled
+        terminal: selected, cancelled
+    }
+}
+
+entity ResumePreparation {
+    request: ResumeRequest
+    harness: Harness
+    native_id: String
+    status: pending | awaiting_model | launched | rejected
+
+    harness_switched: harness != request.invocation_harness
+
+    transitions status {
+        pending -> awaiting_model
+        pending -> launched
+        pending -> rejected
+        awaiting_model -> launched
+        awaiting_model -> rejected
+        terminal: launched, rejected
+    }
+}
+
+entity Receipt {
+    run: CompletedRun
+    resume_target: String?
+}
+
+-- Baseline: Explicit harness selection wins for a fresh launch; otherwise use
+-- the model's configured default. Native-harness aliases select its home harness.
+-- configured_model resolves the model's configured route for the selected harness.
+-- model_route_available checks whether that model/harness pair is configured.
+rule LaunchNewConversation {
+    when: StartNewConversation(request)
+    let harness = request.requested_harness ?? request.default_harness
+    ensures: LaunchFresh(request, harness, configured_model(request.model, harness))
+}
+
+rule RequestResumeResolution {
+    when: RequestResume(request)
+    ensures: LookupRequested(request)
+}
+
+-- Confirmed: A conclusive miss stops at the launcher. It never launches a fresh
+-- conversation or forwards the unmatched query to a harness.
+rule RejectUnmatchedResume {
+    when: resolution: Resolution.created
+    requires: resolution.conclusive
+    requires: resolution.matches.count = 0
+    ensures: ResumeRejected(resolution.request, "No matching conversation")
+}
+
+-- Confirmed: lookup unavailability does not block an exact native-ID attempt.
+-- This fallback does not claim the conversation or its ownership was verified.
+rule TryExactNativeIdWhenLookupUnavailable {
+    when: resolution: Resolution.created
+    requires: not resolution.conclusive
+    requires: resolution.matches.count = 0
+    requires: resolution.request.exact_native_id != null
+    ensures: ResumePreparation.created(
+        request: resolution.request,
+        harness: resolution.request.invocation_harness,
+        native_id: resolution.request.exact_native_id,
+        status: pending
+    )
+}
+
+-- Confirmed: unresolved names and transcript queries require working lookup.
+-- An unavailable lookup is reported distinctly from an authoritative miss.
+rule RejectUnresolvedQueryWhenLookupUnavailable {
+    when: resolution: Resolution.created
+    requires: not resolution.conclusive
+    requires: resolution.matches.count = 0
+    requires: resolution.request.exact_native_id = null
+    ensures: ResumeRejected(resolution.request, "Lookup unavailable")
+}
+
+-- Confirmed: With no harness preference, choose the newest matching conversation.
+rule SelectNewestWithoutHarnessPreference {
+    when: resolution: Resolution.created
+    requires: resolution.matches.count > 0
+    requires: resolution.request.launch.requested_harness = null
+    ensures: ResumeSelection.created(
+        resolution: resolution,
+        conversation: resolution.matches.first,
+        automatic: true,
+        alternatives: resolution.matches.unique - {resolution.matches.first}
+    )
+}
+
+-- Confirmed: A match found only in other harnesses switches automatically.
+rule SwitchWhenRequestedHarnessHasNoMatch {
+    when: resolution: Resolution.created
+    requires: resolution.matches.count > 0
+    requires: resolution.request.launch.requested_harness != null
+    requires: resolution.preferred.count = 0
+    ensures: ResumeSelection.created(
+        resolution: resolution,
+        conversation: resolution.matches.first,
+        automatic: true,
+        alternatives: resolution.matches.unique - {resolution.matches.first}
+    )
+}
+
+-- Confirmed: An interactive request prompts when a newer match belongs to a
+-- different harness and the requested harness also has a match.
+rule PromptForCrossHarnessConflict {
+    when: resolution: Resolution.created
+    requires: resolution.request.launch.requested_harness != null
+    requires: resolution.has_newer_other_harness
+    requires: resolution.request.launch.interactive
+    ensures: ResumePrompt.created(resolution: resolution, status: awaiting_selection)
+    ensures: RequestConversationSelection(resolution.request, resolution.matches)
+}
+
+-- Confirmed: Unattended requests prefer their requested harness. Within that
+-- harness, or without a newer cross-harness conflict, choose its newest match.
+rule PreferRequestedHarness {
+    when: resolution: Resolution.created
+    requires: resolution.request.launch.requested_harness != null
+    requires: resolution.preferred.count > 0
+    requires: not resolution.request.launch.interactive or
+        not resolution.has_newer_other_harness
+    ensures: ResumeSelection.created(
+        resolution: resolution,
+        conversation: resolution.preferred.first,
+        automatic: true,
+        alternatives: resolution.matches.unique - {resolution.preferred.first}
+    )
+}
+
+rule SelectPromptedConversation {
+    when: ChooseConversation(prompt, conversation)
+    requires: prompt.status = awaiting_selection
+    requires: conversation in prompt.resolution.matches
+    ensures: prompt.status = selected
+    ensures: ResumeSelection.created(
+        resolution: prompt.resolution,
+        conversation: conversation,
+        automatic: false,
+        alternatives: prompt.resolution.matches.unique - {conversation}
+    )
+}
+
+rule CancelConversationSelection {
+    when: CancelSelection(prompt)
+    requires: prompt.status = awaiting_selection
+    ensures: prompt.status = cancelled
+    ensures: ResumeRejected(prompt.resolution.request, "Selection cancelled")
+}
+
+rule ResumeSelectedConversation {
+    when: selection: ResumeSelection.created
+    ensures: ResumePreparation.created(
+        request: selection.resolution.request,
+        harness: selection.conversation.harness,
+        native_id: selection.conversation.native_id,
+        status: pending
+    )
+    ensures:
+        if selection.automatic and selection.alternatives.count > 0:
+            ReportAlternatives(selection.resolution.request, selection.alternatives)
+}
+
+-- Confirmed: an unsupported model after a harness switch prompts interactively
+-- and fails in non-interactive mode. Baseline: an unsupported configuration
+-- without a harness switch is rejected.
+rule PrepareResumeModel {
+    when: resume: ResumePreparation.created
+    requires: resume.status = pending
+    ensures:
+        if model_route_available(resume.request.launch.model, resume.harness):
+            resume.status = launched
+            LaunchResume(
+                resume.request.launch,
+                resume.harness,
+                resume.native_id,
+                configured_model(resume.request.launch.model, resume.harness)
+            )
+        else:
+            if resume.harness_switched and resume.request.launch.interactive:
+                resume.status = awaiting_model
+                RequestCompatibleModelSelection(resume)
+            else:
+                resume.status = rejected
+                ResumeRejected(resume.request, "Requested model has no route on the resume harness")
+}
+
+rule SelectCompatibleResumeModel {
+    when: ChooseResumeModel(resume, model)
+    requires: resume.status = awaiting_model
+    requires: model_route_available(model, resume.harness)
+    ensures: resume.status = launched
+    ensures: LaunchResume(
+        resume.request.launch, resume.harness, resume.native_id,
+        configured_model(model, resume.harness)
+    )
+}
+
+rule CancelResumeModelSelection {
+    when: CancelModelSelection(resume)
+    requires: resume.status = awaiting_model
+    ensures: resume.status = rejected
+    ensures: ResumeRejected(resume.request, "Model selection cancelled")
+}
+
+-- Confirmed: Receipts are interactive-only. Baseline: nested launches do not
+-- publish receipts or replace the outer launch's pending receipt.
+rule ShowExitReceipt {
+    when: ShellPromptReturns(run)
+    requires: run.launch.interactive
+    requires: not run.launch.nested
+    requires: not exists Receipt{run}
+    ensures: Receipt.created(
+        run: run,
+        resume_target: run.session_name ?? run.verified_native_id
+    )
+}
+
+invariant ResumeUsesMatchingConversation {
+    for selection in ResumeSelections:
+        selection.conversation in selection.resolution.matches
+}
+
+invariant CurrentConversationExcluded {
+    for resolution in Resolutions:
+        resolution.matches.all(c => c != resolution.request.current_conversation)
+}
+
+invariant InteractiveTopLevelReceiptsOnly {
+    for receipt in Receipts:
+        receipt.run.launch.interactive and not receipt.run.launch.nested
+}
+
+invariant ReceiptAtMostOncePerRun {
+    for a in Receipts:
+        for b in Receipts:
+            a.run = b.run implies a = b
+}
+
+surface AgentLauncher {
+    facing user: Caller
+    context request: LaunchRequest where caller = user
+
+    exposes:
+        request.model
+        request.requested_harness
+        request.default_harness
+
+    provides:
+        StartNewConversation(request)
+
+    @guarantee ResumeQueries
+        -- Resume accepts a native identifier, an agent-mail name (display name,
+        -- slug, or project-qualified address), or transcript message text.
+        -- Exact identifier resolution precedes name resolution, which precedes
+        -- transcript search. Tool arguments and output are not transcript text.
+        -- The resolver distinguishes an authoritative miss from unavailable data.
+        -- A name or transcript query with no resolved conversation fails with a
+        -- lookup-unavailable error when lookup cannot answer. It is not forwarded
+        -- to a harness and is not reported as an authoritative no-match result.
+
+    @guarantee HarnessOwnership
+        -- The selected conversation's owning harness handles the resume, even
+        -- when a different harness was explicitly requested. Translate the resume
+        -- request into the owning harness's native argument syntax.
+        -- If lookup is unavailable and the caller supplied an exact native ID,
+        -- attempt it using the invocation's selected harness without claiming
+        -- verified ownership. An authoritative miss still rejects the resume.
+
+    @guarantee UnsupportedModelAfterSwitch
+        -- When switching harnesses leaves the requested model without a configured
+        -- route, an interactive invocation prompts before continuing. The prompt
+        -- identifies the requested model and owning harness. No resume starts while
+        -- the model choice is unresolved. Non-interactive invocations stop with an
+        -- error rather than silently falling back to the harness's saved/default model.
+
+    @guarantee LaunchEnvironment
+        -- Baseline: launched agents and their subprocesses reach the command
+        -- guards. The wrapper delegates to the real harness without recursion.
+        -- Ordinary harness arguments retain their meaning. Launcher setup must
+        -- not make unrelated repository files available as commands.
+
+    @guarantee IdentitySeparation
+        -- Baseline: a conversation can span multiple runs. Launcher bookkeeping,
+        -- agent-mail identity, and native conversation identity are distinct.
+        -- A resume command names the conversation, not an unrelated run identifier.
+
+    @guarantee ReceiptContents
+        -- At the next supported interactive shell prompt, show the project,
+        -- actual harness, elapsed time, shell-observed exit outcome, and session
+        -- name when available. A normal process exit does not prove task completion.
+        -- Prefer the name for the resume command; otherwise use the verified native
+        -- resume ID. With neither, omit the resume command. Receipt rendering must
+        -- preserve the shell's observed exit status and target the owning harness.
+        -- Baseline: the installed receipt surface is Zsh; Bash has no receipt hook.
+
+    @guarantee AlternativeIdentification
+        -- Automatic selection among multiple matches reports alternatives with
+        -- native IDs so the caller can retry with an exact conversation.
+}
+
+surface ResumeInvocation {
+    facing user: Caller
+    context request: ResumeRequest where launch.caller = user
+
+    exposes:
+        request.query
+        request.launch.requested_harness
+
+    provides:
+        RequestResume(request)
+
+    @guarantee ResolutionResponse
+        -- A lookup supplies a Resolution for this request. An empty conclusive
+        -- result means no match; unavailable lookup data is inconclusive.
+}
+
+surface ConversationSelection {
+    facing user: Caller
+    context prompt: ResumePrompt where resolution.request.launch.caller = user
+
+    exposes:
+        prompt.resolution.request.query
+        prompt.resolution.matches
+        prompt.status
+
+    provides:
+        ChooseConversation(prompt, conversation)
+            when prompt.status = awaiting_selection
+        CancelSelection(prompt)
+            when prompt.status = awaiting_selection
+}
+
+surface ResumeModelSelection {
+    facing user: Caller
+    context resume: ResumePreparation where request.launch.caller = user
+
+    exposes:
+        resume.request.launch.model
+        resume.harness.name
+        resume.status
+
+    provides:
+        ChooseResumeModel(resume, model)
+            when resume.status = awaiting_model
+        CancelModelSelection(resume)
+            when resume.status = awaiting_model
+}
+
+surface ShellReceipt {
+    facing shell: Shell
+    context run: CompletedRun
+
+    exposes:
+        run.launch.project
+        run.actual_harness.name
+        run.session_name
+        run.elapsed
+        run.exit_status
+
+    provides:
+        ShellPromptReturns(run)
+            when run.launch.interactive and not run.launch.nested
+}
+

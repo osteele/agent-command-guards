@@ -8,14 +8,10 @@
 # renders it at the next prompt, the first moment the main screen is back and
 # the only place the exit status is visible.
 #
-# This hook must run LAST, and says so rather than hoping.
-#
-# precmd hooks run in registration order, and only the first sees the real $?
-# and $pipestatus -- a prompt like starship needs both. Sourcing this file a
-# second time (from .zshrc, after the prompt is installed) moves it to the end,
-# where reading the prompt's captured status is correct and nothing downstream
-# is left to harm. Deregister first so the second source moves it rather than
-# adding it twice.
+# Register once, after prompt setup. Zsh invokes each precmd hook with the
+# original command status and restores the calling status/pipeline afterwards.
+# Do not use a prompt theme's cached status: it may be absent or stale.
+# Re-sourcing moves this hook last without registering it twice.
 autoload -Uz add-zsh-hook
 
 # Keyed by TERM_SESSION_ID, the one identifier the launcher and an interactive
@@ -29,17 +25,21 @@ autoload -Uz add-zsh-hook
 }
 
 _agent_epilogue() {
-  # Running last, $? is the previous hook's, so take the status the prompt
-  # captured. Falling back to $? covers a shell with no starship.
-  local st="${STARSHIP_CMD_STATUS:-$?}"
+  # Capture before any command. Zsh preserves $? and $pipestatus around the
+  # registered hook; returning zero lets other prompt/periodic hooks run.
+  local st=$?
   [[ -f $_AGENT_EPILOGUE_FILE ]] || return 0
+  # Claim before reading: two shells sharing a terminal key must not both
+  # render the same card. A failed claim leaves it for a later prompt.
+  local pending="${_AGENT_EPILOGUE_FILE}.$$"
+  mv -- "$_AGENT_EPILOGUE_FILE" "$pending" 2>/dev/null || return 0
 
   # One argument per line, exactly as the launcher wrote them. Read into an
   # array rather than word-split: a project path may contain spaces, and zsh
   # does not split an unquoted expansion anyway.
   local -a card
-  card=("${(@f)$(<$_AGENT_EPILOGUE_FILE)}")
-  rm -f -- "$_AGENT_EPILOGUE_FILE"
+  card=("${(@f)$(<$pending)}")
+  rm -f -- "$pending"
   (( ${#card} )) || return 0
 
   "${_AGENT_EPILOGUE_RENDERER}" "${card[@]}" --status "$st" 2>/dev/null

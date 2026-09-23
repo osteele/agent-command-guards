@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -29,20 +30,36 @@ if os.name == "nt":
     # concurrent writers still serialize there.
     import msvcrt
 
-    def acquire_lock(lock_fd: int) -> None:
+    def acquire_lock(lock_fd: int, offset: int = 0) -> None:
+        os.lseek(lock_fd, offset, os.SEEK_SET)
         msvcrt.locking(lock_fd, msvcrt.LK_LOCK, 1)
 
-    def release_lock(lock_fd: int) -> None:
+    def release_lock(lock_fd: int, offset: int = 0) -> None:
+        os.lseek(lock_fd, offset, os.SEEK_SET)
         msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
 
+    def try_acquire_lock(lock_fd: int, offset: int = 0) -> bool:
+        os.lseek(lock_fd, offset, os.SEEK_SET)
+        try:
+            msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
 else:
     import fcntl
 
-    def acquire_lock(lock_fd: int) -> None:
+    def acquire_lock(lock_fd: int, offset: int = 0) -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    def release_lock(lock_fd: int) -> None:
+    def release_lock(lock_fd: int, offset: int = 0) -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    def try_acquire_lock(lock_fd: int, offset: int = 0) -> bool:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
 
 # Managed hosts that require network checks
 TARGET_HOSTS = {"alpha", "beta", "gamma"}
@@ -52,6 +69,10 @@ SSH_NON_CONNECTING_OPTIONS = {"-G", "-Q", "-V"}
 STATE_DIR = Path.home() / ".cache" / "agent-command-guards"
 STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
+DIALOG_TIMEOUT = 300
+CONFIRMATION_TIMEOUT = DIALOG_TIMEOUT + 5
+# Windows byte locks are mandatory: keep the owner lock outside the JSON bytes.
+CONFIRMATION_LOCK_OFFSET = 4096
 
 # SSH options that consume the next argument
 SSH_OPTIONS_WITH_VALUES = {
@@ -140,6 +161,7 @@ class HostState:
     declined: bool  # User said "No" to dialog
     last_checked: str  # ISO timestamp
     was_accessible: bool  # Last known accessibility
+    pending_confirmation: str | None = None
 
 
 @contextmanager
@@ -167,6 +189,14 @@ def load_state() -> dict[str, HostState]:
             not isinstance(state.declined, bool)
             or not isinstance(state.last_checked, str)
             or not isinstance(state.was_accessible, bool)
+            or (
+                state.pending_confirmation is not None
+                and (
+                    not isinstance(state.pending_confirmation, str)
+                    or len(state.pending_confirmation) != 32
+                    or any(c not in "0123456789abcdef" for c in state.pending_confirmation)
+                )
+            )
             for state in state_by_host.values()
         ):
             return {}
@@ -392,11 +422,8 @@ def probe_host(host: str, ssh_binary: str) -> bool:
         return False
 
 
-def show_network_dialog(host: str) -> bool:
-    """Show macOS dialog asking if user wants to change network.
-
-    Returns True if user clicked "Yes" (will change network), False for "No".
-    """
+def show_network_dialog(host: str) -> bool | None:
+    """Return Yes, No, or None when no explicit answer could be obtained."""
     script = f"""
     display dialog "Cannot reach {host}.
 
@@ -408,11 +435,17 @@ Change network connection to access this host?" buttons {{"No", "Yes"}} default 
             capture_output=True,
             check=False,
             text=True,
-            timeout=300,
+            timeout=DIALOG_TIMEOUT,
         )
-        return result.returncode == 0 and "Yes" in result.stdout
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+        if result.returncode == 0:
+            answer = result.stdout.strip()
+            if answer == "button returned:Yes":
+                return True
+            if answer == "button returned:No":
+                return False
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
 
 
 def should_show_dialog(
@@ -434,82 +467,196 @@ def should_show_dialog(
     return not host_state.declined  # Show if not declined
 
 
-def record_declined(host: str) -> None:
-    """Record that user declined the dialog for this host."""
-    with state_lock():
-        state = load_state()
-        state[host] = HostState(
-            declined=True,
-            last_checked=datetime.now(timezone.utc).isoformat(),
-            was_accessible=False,
-        )
-        save_state(state)
-
 
 def record_accessible(host: str) -> None:
     """Record that host is accessible (resets declined state)."""
     with state_lock():
         state = load_state()
+        previous = state.get(host)
         state[host] = HostState(
             declined=False,
             last_checked=datetime.now(timezone.utc).isoformat(),
             was_accessible=True,
+            pending_confirmation=previous.pending_confirmation if previous else None,
         )
         save_state(state)
 
 
+def confirmation_path(host: str, token: str) -> Path:
+    return STATE_DIR / f"confirmation-{host}-{token}.json"
+
+
+def remove_confirmation(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        if os.name != "nt":
+            raise
+        # Windows cannot unlink an open file. Each participant retries after
+        # closing; a later request collects any file left by a killed process.
+
+
+def read_confirmation(fd: int) -> dict:
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        result = json.loads(os.read(fd, 4096))
+        if (
+            isinstance(result, dict)
+            and isinstance(result.get("deadline"), (float, int))
+            and 0 < result["deadline"] < float("inf")
+            and result.get("answer") in ("pending", "accepted", "declined", "unavailable")
+        ):
+            return result
+    except (ValueError, UnicodeDecodeError):
+        pass
+    return {"deadline": 0, "answer": "unavailable"}
+
+
+def write_confirmation(fd: int, confirmation: dict) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = json.dumps(confirmation).encode()
+    os.write(fd, data)
+    os.ftruncate(fd, len(data))
+
+
+def finish_confirmation(
+    host: str,
+    token: str,
+    fd: int,
+    answer: str,
+    state: dict[str, HostState],
+) -> str:
+    """Publish once under state_lock; open descriptors retain the shared answer."""
+    confirmation = read_confirmation(fd)
+    if confirmation["answer"] == "pending":
+        confirmation["answer"] = answer
+        write_confirmation(fd, confirmation)
+    answer = confirmation["answer"]
+    host_state = state.get(host)
+    if host_state is not None and host_state.pending_confirmation == token:
+        host_state.pending_confirmation = None
+        if answer == "declined":
+            host_state.declined = True
+        save_state(state)
+    remove_confirmation(confirmation_path(host, token))
+    return answer
+
+
+def confirmation_unavailable(fd: int, confirmation: dict) -> bool:
+    """An abandoned owner or expired lease cannot leave requests waiting forever."""
+    if time.monotonic() >= confirmation["deadline"]:
+        return True
+    if try_acquire_lock(fd, CONFIRMATION_LOCK_OFFSET):
+        release_lock(fd, CONFIRMATION_LOCK_OFFSET)
+        return True
+    return False
+
+
+def join_confirmation(host: str) -> tuple[str, int, bool] | None:
+    """Atomically join a live prompt or acquire ownership of a new one."""
+    with state_lock():
+        state = load_state()
+        host_state = state.get(host)
+        show_dialog = should_show_dialog(host, is_accessible=False, state=state)
+        if host_state is None:
+            host_state = state[host] = HostState(False, "", False)
+        host_state.was_accessible = False
+        host_state.last_checked = datetime.now(timezone.utc).isoformat()
+        token = host_state.pending_confirmation
+        # Only our generation files are collected. Unlinking never invalidates a
+        # joined request's descriptor, and a dead request leaves no retained file.
+        for path in STATE_DIR.glob(f"confirmation-{host}-*.json"):
+            if token is None or path != confirmation_path(host, token):
+                remove_confirmation(path)
+        if token is not None:
+            try:
+                fd = os.open(confirmation_path(host, token), os.O_RDWR)
+            except FileNotFoundError:
+                host_state.pending_confirmation = None
+            else:
+                confirmation = read_confirmation(fd)
+                if confirmation["answer"] == "pending":
+                    if confirmation_unavailable(fd, confirmation):
+                        finish_confirmation(host, token, fd, "unavailable", state)
+                    else:
+                        save_state(state)
+                    return token, fd, False
+                # An owner may have died after writing its answer but before
+                # retiring the prompt. Do not grant that answer to a later caller.
+                finish_confirmation(host, token, fd, confirmation["answer"], state)
+                os.close(fd)
+                show_dialog = not host_state.declined
+        if not show_dialog:
+            save_state(state)
+            return None
+        token = os.urandom(16).hex()
+        fd = os.open(confirmation_path(host, token), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            acquire_lock(fd, CONFIRMATION_LOCK_OFFSET)
+            write_confirmation(
+                fd, {"deadline": time.monotonic() + CONFIRMATION_TIMEOUT, "answer": "pending"}
+            )
+            host_state.pending_confirmation = token
+            save_state(state)
+        except BaseException:
+            os.close(fd)
+            remove_confirmation(confirmation_path(host, token))
+            raise
+        return token, fd, True
+
+
+def await_confirmation(host: str, token: str, fd: int) -> str:
+    while True:
+        with state_lock():
+            confirmation = read_confirmation(fd)
+            if confirmation["answer"] != "pending":
+                return confirmation["answer"]
+            if confirmation_unavailable(fd, confirmation):
+                return finish_confirmation(host, token, fd, "unavailable", load_state())
+        time.sleep(0.05)
+
+
 def check_host(host: str, ssh_binary: str) -> bool:
-    """Check if host is accessible, handling dialog if needed.
-
-    Returns True if we should proceed with the command, False to abort.
-    """
-    is_accessible = probe_host(host, ssh_binary)
-
-    if is_accessible:
+    """Probe every request, sharing only the outstanding prompt's answer."""
+    if probe_host(host, ssh_binary):
         record_accessible(host)
         return True
 
-    # Host not accessible - check if we should show dialog
-    with state_lock():
-        state = load_state()
-        show_dialog = should_show_dialog(host, is_accessible=False, state=state)
-
-        if show_dialog:
-            # Update state to show we're checking
-            if host not in state:
-                state[host] = HostState(
-                    declined=False,
-                    last_checked=datetime.now(timezone.utc).isoformat(),
-                    was_accessible=False,
-                )
+    joined = join_confirmation(host)
+    answer = "declined" if joined is None else None
+    if joined is not None:
+        token, fd, owner = joined
+        try:
+            if owner:
+                result = show_network_dialog(host)
+                if result is True:
+                    answer = "accepted"
+                elif result is False:
+                    answer = "declined"
+                else:
+                    answer = "unavailable"
+                with state_lock():
+                    answer = finish_confirmation(host, token, fd, answer, load_state())
             else:
-                state[host].was_accessible = False
-                state[host].last_checked = datetime.now(timezone.utc).isoformat()
-            save_state(state)
-
-    if show_dialog:
-        if show_network_dialog(host):
-            # User said "Yes" - they'll change network, proceed
-            return True
-        else:
-            # User said "No"
-            record_declined(host)
-            print(
-                f"Error: {host} is not accessible.\n"
-                f"The host will not be available until you change your network settings.\n"
-                f"Note: Using other SSH options or ping will not help.",
-                file=sys.stderr,
-            )
-            return False
+                print(f"Waiting for shared confirmation for {host}.", file=sys.stderr, flush=True)
+                answer = await_confirmation(host, token, fd)
+        finally:
+            # Closing releases the owner's advisory lock even on cancellation.
+            os.close(fd)
+            if answer in ("accepted", "declined", "unavailable"):
+                remove_confirmation(confirmation_path(host, token))
+    if answer == "accepted":
+        return True
+    if answer == "unavailable":
+        print(f"Error: Confirmation for {host} is unavailable; connection refused.", file=sys.stderr)
     else:
-        # Dialog was previously declined
         print(
             f"Error: {host} is not accessible.\n"
             f"The host will not be available until you change your network settings.\n"
             f"Note: Using other SSH options or ping will not help.",
             file=sys.stderr,
         )
-        return False
+    return False
 
 
 def main() -> int:

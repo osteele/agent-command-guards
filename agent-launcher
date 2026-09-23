@@ -25,7 +25,7 @@ SHELL_INIT_DIR="$LAUNCHER_DIR/launchers/shell-init"
 NESTED_LAUNCH=false
 if [[ -n "${AGENT_COMMAND_GUARDS_ACTIVE:-}" || -n "${CLAUDECODE:-}" \
       || -n "${CLAUDE_CODE_SESSION_ID:-}" || -n "${AGENT_SESSION_ID:-}" \
-      || -n "${GEMINI_CLI:-}" ]]; then
+      || -n "${CODEX_THREAD_ID:-}" || -n "${GEMINI_CLI:-}" ]]; then
     NESTED_LAUNCH=true
 fi
 
@@ -232,11 +232,11 @@ new_session_id() {
     fi
 }
 
-# The resume flags each agent spells differently. Shared by the AgentsView
-# prefix strip below and by resume_id_from_args, so the two can never
-# disagree about what counts as a resume argument.
+# Native resume markers used for preparation and session identity extraction.
+# Keep these in step with agent-model's NATIVE_RESUME_FLAGS.
 resume_flags() {
     case "$NAME" in
+        claude)   printf '%s' " -r --resume " ;;
         kimi)     printf '%s' " -r --resume -S --session " ;;
         omp)      printf '%s' " -r --resume " ;;
         codex)    printf '%s' " resume " ;;
@@ -246,18 +246,19 @@ resume_flags() {
     esac
 }
 
-# The AgentsView canonical prefixes that name this agent's sessions, or
-# non-zero for an agent AgentsView does not index. AgentsView lists sessions
-# as `<agent>:<native id>`: `omp:<uuid>`, `codex:<uuid>`, `opencode:ses_<token>`,
-# `kimi:<machine>:<channel>:session_<uuid>` (the native id is everything
-# through the last colon), and `antigravity-cli:<uuid>` -- Antigravity is
-# indexed under its product CLI name while this launcher's symlink is `agy`.
-agentsview_prefixes() {
-    case "$NAME" in
-        agy)                     printf '%s' " antigravity-cli " ;;
-        kimi|opencode|codex|omp) printf '%s' " $NAME " ;;
-        *)                       return 1 ;;
+# Keep native value-taking options in step with agent-model.argument_takes_value.
+argument_takes_value() {
+    case "$1" in
+        --model|-m|--provider|--config|-c|--profile|--cd|-C|--resume|-r|--session|-s|-S|--conversation|--mode)
+            return 0 ;;
     esac
+    if [[ "$NAME" == "codex" ]]; then
+        case "$1" in
+            -p|-i|--image|--enable|--disable|--remote|--remote-auth-token-env|--local-provider|--sandbox|--add-dir|-a|--ask-for-approval|--output-schema|--output-last-message|-o)
+                return 0 ;;
+        esac
+    fi
+    return 1
 }
 
 # The session id an explicit resume argument names, or non-zero when the
@@ -267,17 +268,16 @@ agentsview_prefixes() {
 # uses `ses_` followed by an opaque token, and omp, codex, and agy use a bare
 # uuid.
 #
-# Matched against a shape rather than accepted verbatim, so that `--last`, a
-# path, or a session *name* does not become an address. AgentsView-prefixed
-# forms never reach this matcher: the strip below rewrites them to native ids
-# first, which is also what keeps a resumed session on the AGENT_SESSION_ID
-# it launched with.
+# Picker options and names must not become an address.
+# Canonical prefixes are normalized by the shared resolver before this matcher,
+# keeping a resumed launch on the native identity selected for it.
 resume_id_from_args() {
     local flags name value uuid
     flags="$(resume_flags)" || return 1
     local uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     while [[ $# -gt 0 ]]; do
         name="$1"
+        [[ "$name" == "--" ]] && break
         value=""
         if [[ "$name" == *=* ]]; then
             value="${name#*=}"
@@ -290,10 +290,115 @@ resume_id_from_args() {
                 return 0
             fi
         fi
+        if [[ "$1" != *=* ]] && argument_takes_value "$name"; then
+            shift
+            if (( $# )); then shift; fi
+            continue
+        fi
         shift
     done
     return 1
 }
+
+# Both TTY directions are required, even if a headless CLI inherits a terminal.
+INTERACTIVE_LAUNCH=false
+if [[ -t 0 && -t 1 ]]; then
+    INTERACTIVE_LAUNCH=true
+    launch_skip_value=false
+    launch_mode_value=false
+    for launch_argument in "$@"; do
+        if $launch_skip_value; then
+            if $launch_mode_value && [[ "$launch_argument" == "json" || "$launch_argument" == "rpc" ]]; then
+                INTERACTIVE_LAUNCH=false
+                break
+            fi
+            launch_skip_value=false
+            launch_mode_value=false
+            continue
+        fi
+        [[ "$launch_argument" == "--" ]] && break
+        case "$NAME:$launch_argument" in
+            *:--help|*:-h|*:--version|*:-V|omp:--mode=json|omp:--mode=rpc|\
+            codex:review|codex:login|codex:logout|codex:mcp|codex:plugin|\
+            codex:app-server|codex:remote-control|codex:app|codex:completion|\
+            codex:update|codex:doctor|codex:sandbox|codex:debug|codex:apply|codex:a|\
+            codex:queue|codex:archive|codex:delete|codex:migrate-rollouts|\
+            codex:unarchive|codex:cloud|codex:exec-server|codex:features|codex:help)
+                INTERACTIVE_LAUNCH=false
+                break
+                ;;
+            codex:exec|codex:e|opencode:run|omp:--print|omp:-p|omp:--print=*|\
+            kimi:--print|kimi:-p|kimi:--print=*|agy:--print|agy:-p|agy:--print=*)
+                INTERACTIVE_LAUNCH=false
+                break
+                ;;
+        esac
+        if argument_takes_value "$launch_argument"; then
+            launch_skip_value=true
+            [[ "$NAME" == "omp" && "$launch_argument" == "--mode" ]] && launch_mode_value=true
+            continue
+        fi
+        if [[ "$NAME" == "codex" || "$NAME" == "opencode" ]]; then
+            if [[ "$launch_argument" != -* ]]; then break; fi
+        fi
+    done
+    unset launch_skip_value launch_mode_value launch_argument
+fi
+
+# Resolve before changing identity, credentials, PATH or the real executable:
+# the selected conversation can belong to another harness.
+if lookup_flags="$(resume_flags)"; then
+    lookup_needed=false
+    lookup_next=false
+    lookup_skip_value=false
+    for lookup_arg in "$@"; do
+        if $lookup_skip_value; then
+            lookup_skip_value=false
+            continue
+        fi
+        [[ "$lookup_arg" == "--" ]] && break
+        if $lookup_next; then
+            [[ -n "$lookup_arg" && "$lookup_arg" != -* ]] && lookup_needed=true
+            break
+        fi
+        lookup_flag="${lookup_arg%%=*}"
+        if [[ "$lookup_flags" == *" $lookup_flag "* ]]; then
+            if [[ "$lookup_arg" == *=* ]]; then
+                [[ -n "${lookup_arg#*=}" ]] && lookup_needed=true
+                break
+            fi
+            lookup_next=true
+        elif [[ "$lookup_arg" != *=* ]] && argument_takes_value "$lookup_flag"; then
+            lookup_skip_value=true
+        elif [[ "$NAME" == "codex" && "$lookup_arg" != -* && "$lookup_arg" != "exec" && "$lookup_arg" != "e" ]]; then
+            break
+        fi
+    done
+    if $lookup_needed; then
+        AGENT_MODEL="$LAUNCHER_DIR/launchers/agent-model"
+        lookup_file="$(mktemp "${TMPDIR:-/tmp}/agent-resume.XXXXXX")"
+        trap 'rm -f "$lookup_file"' EXIT
+        lookup_options=("$NAME")
+        $INTERACTIVE_LAUNCH && lookup_options+=("--interactive")
+        if ! "$AGENT_MODEL" prepare-resume "${lookup_options[@]}" -- "$@" > "$lookup_file"; then
+            exit 2
+        fi
+        lookup_args=()
+        while IFS= read -r -d '' lookup_arg; do
+            lookup_args+=("$lookup_arg")
+        done < "$lookup_file"
+        rm -f "$lookup_file"
+        trap - EXIT
+        if [[ ${#lookup_args[@]} -eq 0 ]]; then
+            printf 'Error: resume preparation returned no invocation\n' >&2
+            exit 2
+        fi
+        NAME="${lookup_args[0]}"
+        set -- "${lookup_args[@]:1}"
+        unset lookup_args lookup_options
+    fi
+    unset lookup_flags lookup_needed lookup_next lookup_skip_value lookup_arg lookup_flag
+fi
 
 REAL_BINARY="$(find_real_binary)"
 
@@ -340,150 +445,6 @@ fi
 # identity, which is worse than broadcasting -- work would be attributed to one
 # specific wrong session.
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID
-# AgentsView lists every session under a canonical id, and the natural thing
-# to do with a copied id is to paste it back. The agents resolve only their
-# native ids: `omp --resume omp:<uuid>` fails with `Session "omp:<uuid>" not
-# found` (verified against omp 18.1.15). Rewrite the pasted form in place
-# before anything reads the command line, so the agent sees an id it can
-# resolve and the resume-id matcher below keeps the session on the
-# AGENT_SESSION_ID it was first launched with. Shape-matched like
-# resume_id_from_args: a prefix on anything that is not a native id passes
-# through untouched, and each launcher strips only its own agent's prefix, so
-# `omp --resume codex:<uuid>` reaches omp as typed and fails there.
-if strip_prefixes="$(agentsview_prefixes)"; then
-    strip_flags="$(resume_flags)" || strip_flags=""
-    strip_uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-    strip_native_re="^((session_)?${strip_uuid}|ses_[A-Za-z0-9]{10,})$"
-    strip_args=("$@")
-    if [[ ${#strip_args[@]} -gt 0 ]]; then
-        for strip_i in "${!strip_args[@]}"; do
-            strip_name="${strip_args[strip_i]}"
-            strip_value=""
-            if [[ "$strip_name" == *=* ]]; then
-                strip_value="${strip_name#*=}"
-                strip_name="${strip_name%%=*}"
-            fi
-            [[ "$strip_flags" == *" $strip_name "* ]] || continue
-            strip_target="$strip_i"
-            if [[ -z "$strip_value" ]]; then
-                strip_target=$((strip_i + 1))
-                [[ "$strip_target" -lt ${#strip_args[@]} ]] || continue
-                strip_value="${strip_args[strip_target]}"
-            fi
-            strip_stripped=""
-            for strip_prefix in $strip_prefixes; do
-                [[ "$strip_value" == "$strip_prefix:"* ]] || continue
-                if [[ "$NAME" == "kimi" ]]; then
-                    # kimi's canonical id qualifies the native session_<uuid>
-                    # with machine and channel segments.
-                    strip_stripped="${strip_value##*:}"
-                else
-                    strip_stripped="${strip_value#"$strip_prefix:"}"
-                fi
-                break
-            done
-            [[ -n "$strip_stripped" ]] || continue
-            [[ "$strip_stripped" =~ $strip_native_re ]] || continue
-            if [[ "$strip_target" == "$strip_i" ]]; then
-                strip_args[strip_target]="${strip_name}=${strip_stripped}"
-            else
-                strip_args[strip_target]="$strip_stripped"
-            fi
-        done
-        set -- "${strip_args[@]}"
-    fi
-    unset strip_args strip_i strip_name strip_value strip_target strip_stripped
-    unset strip_prefix strip_prefixes strip_flags strip_uuid strip_native_re
-fi
-
-# A resume argument that is not a session id at all: an agent-mail session name
-# ("Efficient Deer") or a line remembered from the session's transcript. Both
-# name a session a person can see in a dashboard or a message but cannot paste
-# an id for. launchers/agent-model owns the lookup -- it already resolves ids
-# through AgentsView for the model-first commands, and one implementation means
-# the two entry points cannot disagree about what a name resolves to.
-#
-# Nothing is spent on the common path: the shapes each agent resolves itself
-# are matched here and never reach the lookup.
-AGENT_MODEL="$LAUNCHER_DIR/launchers/agent-model"
-
-resolve_session_argument() {
-    local query="$1" expected="$2" resolved id harness command
-    if [[ ! -x "$AGENT_MODEL" ]]; then
-        printf 'WARN Cannot resolve %s: %s is missing, so it reaches %s as typed\n' \
-            "$query" "$AGENT_MODEL" "$NAME" >&2
-        return 1
-    fi
-    # stderr is deliberately not captured: an ambiguous name reports the
-    # session it chose and the ones it passed over, and that belongs on the
-    # terminal rather than in this substitution.
-    resolved="$("$AGENT_MODEL" resolve-session "$query" --agent "$expected")" || return 1
-    id="$(printf '%s\n' "$resolved" | sed -n 1p)"
-    harness="$(printf '%s\n' "$resolved" | sed -n 2p)"
-    command="$(printf '%s\n' "$resolved" | sed -n 3p)"
-    [[ -n "$id" ]] || return 1
-    if [[ -n "$harness" && "$harness" != "$expected" ]]; then
-        printf 'Error: %s is a %s session, which %s cannot resume. Instead run:\n' \
-            "$query" "$harness" "$NAME" >&2
-        printf '       %s %s\n' "${command:-$harness}" "$id" >&2
-        # Status, not `exit`: this runs inside a command substitution, where an
-        # exit would end only the subshell and let the launch continue. 3 is taken:
-        # agent-model spends it on "nothing matched".
-        return 4
-    fi
-    printf '%s\n' "$id"
-}
-
-if resume_lookup_flags="$(resume_flags)"; then
-    resume_lookup_agent="$(agentsview_prefixes 2>/dev/null || printf '%s' "$NAME")"
-    # agentsview_prefixes pads its single token with spaces for substring
-    # matching; AgentsView wants the bare agent name.
-    resume_lookup_agent="${resume_lookup_agent// /}"
-    lookup_uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-    lookup_native_re="^((session_)?${lookup_uuid}|ses_[A-Za-z0-9]{10,})$"
-    lookup_args=("$@")
-    # An empty array is an unbound expansion under `set -u` in bash 3.2, which
-    # is what /bin/bash is on macOS.
-    if [[ ${#lookup_args[@]} -gt 0 ]]; then
-        for lookup_i in "${!lookup_args[@]}"; do
-            lookup_name="${lookup_args[lookup_i]}"
-            lookup_value=""
-            if [[ "$lookup_name" == *=* ]]; then
-                lookup_value="${lookup_name#*=}"
-                lookup_name="${lookup_name%%=*}"
-            fi
-            [[ "$resume_lookup_flags" == *" $lookup_name "* ]] || continue
-            lookup_target="$lookup_i"
-            if [[ -z "$lookup_value" ]]; then
-                lookup_target=$((lookup_i + 1))
-                [[ "$lookup_target" -lt ${#lookup_args[@]} ]] || continue
-                lookup_value="${lookup_args[lookup_target]}"
-            fi
-            # An option, a picker selector such as --last, and an id the agent
-            # already resolves are all left alone.
-            [[ -n "$lookup_value" && "$lookup_value" != -* ]] || continue
-            if [[ "$lookup_value" =~ $lookup_native_re ]]; then
-                continue
-            fi
-            lookup_status=0
-            lookup_resolved="$(resolve_session_argument \
-                "$lookup_value" "$resume_lookup_agent")" || lookup_status=$?
-            if [[ "$lookup_status" -eq 4 ]]; then
-                exit 2
-            fi
-            [[ "$lookup_status" -eq 0 && -n "$lookup_resolved" ]] || continue
-            if [[ "$lookup_target" == "$lookup_i" ]]; then
-                lookup_args[lookup_target]="${lookup_name}=${lookup_resolved}"
-            else
-                lookup_args[lookup_target]="$lookup_resolved"
-            fi
-        done
-        set -- "${lookup_args[@]}"
-    fi
-    unset lookup_args lookup_i lookup_name lookup_value lookup_target
-    unset lookup_resolved lookup_status lookup_uuid lookup_native_re resume_lookup_flags
-    unset resume_lookup_agent
-fi
 
 # A resumed session is the same session. Minting a fresh id for it would give
 # it a new address on every resume, and downstream a new agent-mail name, so
@@ -558,7 +519,8 @@ fi
 #
 # One argument per line, consumed verbatim as agent-epilogue's argv: a format
 # with no quoting rules cannot disagree with its reader about them.
-if [[ "$NESTED_LAUNCH" == false && -t 1 ]]; then
+# Claude's separate wrapper publishes its own SessionEnd receipt.
+if [[ "$NESTED_LAUNCH" == false && "$INTERACTIVE_LAUNCH" == true && "$NAME" != "claude" ]]; then
     epilogue_dir="${AGENT_EPILOGUE_DIR:-$HOME/.cache/agent-command-guards/epilogue}"
     epilogue_key="${TERM_SESSION_ID:-}"
     [[ -z "$epilogue_key" ]] && epilogue_key="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' /')"

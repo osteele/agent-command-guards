@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.test_agent_model import run_pty
+
 REPO = Path(__file__).resolve().parent.parent
 SHADOWS = REPO / "shadows"
 LAUNCHER = REPO / "agent-launcher"
@@ -59,18 +61,23 @@ class AgentLauncherTest(unittest.TestCase):
         # An empty HOME keeps the installer fallbacks (~/.kimi-code/bin/kimi)
         # from reaching the real agent binaries on this machine.
         self.environment["HOME"] = str(self.fake_home)
+        self.environment["AGENT_EPILOGUE_DIR"] = str(self.tmp / "epilogue")
+        self.environment.pop("XDG_CONFIG_HOME", None)
         self.environment.pop("ZDOTDIR", None)
         self.environment.pop("AGENT_COMMAND_GUARDS_ACTIVE", None)
         self.environment.pop("OPENAI_API_KEY", None)
         self.environment.pop("ANTHROPIC_API_KEY", None)
         self.environment.pop("AGENT_LAUNCHER_KEEP_API_KEYS", None)
+        for variable in ("AGENT_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE", "GEMINI_CLI"):
+            self.environment.pop(variable, None)
+        self.install_python()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
     def install_real(self, name: str) -> Path:
         real = self.real_bin / name
-        real.write_text(REPORT_ENVIRONMENT)
+        real.write_text(REPORT_ENVIRONMENT + f'\nprintf launched >> "{self.tmp / "executed"}"\n')
         real.chmod(0o755)
         return real
 
@@ -97,6 +104,29 @@ class AgentLauncherTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("agent-named symlink", result.stderr)
+
+    def test_resume_word_as_profile_value_does_not_select_a_conversation(self) -> None:
+        """LaunchNewConversation preserves native option values and fresh identity."""
+        self.install_real("codex")
+        self.install_real("omp")
+        self.install_agentsview({OMP_RESUME_ID: "omp"})
+
+        result = self.launch("codex", "--profile", "resume", OMP_RESUME_ID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--profile resume {OMP_RESUME_ID}", result.stdout)
+        self.assertNotEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_native_resume_after_a_profile_value_selects_the_actual_identifier(self) -> None:
+        """ResumeQueries consumes option values before looking for the native resume marker."""
+        self.install_real("codex")
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+
+        result = self.launch("codex", "--profile", "resume", "resume", CODEX_RESUME_ID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--profile resume resume {CODEX_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), CODEX_RESUME_ID)
 
     def test_skips_itself_when_finding_the_real_binary(self) -> None:
         # The launcher sits ahead of the real binary on PATH; resolving `kimi`
@@ -229,14 +259,13 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
         self.assertEqual(self.session_id(result), OMP_RESUME_ID)
 
-    def test_omp_passes_a_non_uuid_prefixed_value_through(self) -> None:
-        # Shape-matched like the resume-id matcher: only `omp:<uuid>` counts,
-        # so an `omp:`-prefixed path or name reaches OMP as typed.
+    def test_unresolved_prefixed_name_never_reaches_the_provider(self) -> None:
+        """RejectUnresolvedQueryWhenLookupUnavailable applies to prefixed non-IDs."""
         self.install_real("omp")
         result = self.launch("omp", "--resume", "omp:not-a-uuid")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("args=--resume omp:not-a-uuid", result.stdout)
-        self.assertNotEqual(self.session_id(result), "omp:not-a-uuid")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Lookup unavailable", result.stderr)
+        self.assertNotIn("args=", result.stdout)
 
     def test_other_agents_get_no_prefix_rewrite(self) -> None:
         # The rewrite is OMP-specific; kimi's own `session_` prefix must reach
@@ -292,30 +321,27 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn(f"args=--conversation {AGY_RESUME_ID}", result.stdout)
         self.assertEqual(self.session_id(result), AGY_RESUME_ID)
 
-    def test_a_foreign_agentsview_prefix_passes_through(self) -> None:
-        # Each launcher strips only its own agent's prefix: a codex id pasted
-        # into omp is not an omp session, and omp's own not-found error is the
-        # truthful answer.
-        self.install_real("omp")
-        result = self.launch("omp", "--resume", f"codex:{CODEX_RESUME_ID}")
+    def test_foreign_verified_prefix_switches_harness_and_resume_spelling(self) -> None:
+        """SwitchWhenRequestedHarnessHasNoMatch preserves identity and guards."""
+        self.install_real("codex")
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+        result = self.launch("omp", "--resume", f"codex:{CODEX_RESUME_ID}", "prompt text")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"args=--resume codex:{CODEX_RESUME_ID}", result.stdout)
-        self.assertNotEqual(self.session_id(result), f"codex:{CODEX_RESUME_ID}")
+        self.assertIn(f"args=resume {CODEX_RESUME_ID} prompt text", result.stdout)
+        self.assertEqual(self.session_id(result), CODEX_RESUME_ID)
+        self.assertIn("guards=1", result.stdout)
+        self.assertIn(f"zdotdir={SHELL_INIT}", result.stdout)
 
-    def test_a_prefix_agentsview_does_not_use_passes_through(self) -> None:
-        # `agy:` is not an AgentsView form (`antigravity-cli:` is), so a
-        # conversation value carrying it reaches the agent as typed.
+    def test_agy_native_prefix_is_normalized(self) -> None:
+        """TryExactNativeIdWhenLookupUnavailable preserves invocation harness."""
         self.install_real("agy")
         result = self.launch("agy", "--conversation", f"agy:{AGY_RESUME_ID}")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"args=--conversation agy:{AGY_RESUME_ID}", result.stdout)
+        self.assertIn(f"args=--conversation {AGY_RESUME_ID}", result.stdout)
 
     # --- resume arguments that are not session ids -------------------------
     #
-    # The launcher hands anything that is not a native id to
-    # launchers/agent-model, which resolves an agent-mail session name or a
-    # line of transcript text to one. These drive the real agent-model, so they
-    # need an interpreter that satisfies its floor and a fake AgentsView.
+    # Direct resumes share the model-first resolver, including exact IDs.
 
     def install_python(self) -> None:
         """Put this suite's interpreter on PATH as `python3`.
@@ -325,7 +351,9 @@ class AgentLauncherTest(unittest.TestCase):
         is older, and a symlink is narrower than adding that interpreter's whole
         directory -- which would also expose the real AgentsView.
         """
-        (self.real_bin / "python3").symlink_to(sys.executable)
+        path = self.real_bin / "python3"
+        if not path.exists():
+            path.symlink_to(sys.executable)
 
     def install_session_name(self, session_id: str, display_name: str) -> None:
         directory = self.fake_home / ".claude" / "agent-mail" / "session-names"
@@ -357,9 +385,9 @@ class AgentLauncherTest(unittest.TestCase):
                     {
                         "session_id": canonical,
                         "agent": canonical.split(":", 1)[0],
-                        "timestamp": "2026-09-14T23:07:13.647Z",
+                        "timestamp": f"2026-09-{14 + index:02}T23:07:13.647Z",
                     }
-                    for canonical in (found or [])
+                    for index, canonical in enumerate(found or [])
                 ]
             }
         )
@@ -370,7 +398,7 @@ class AgentLauncherTest(unittest.TestCase):
         script.append('  get) case "$3" in')
         for session_id, document in metadata.items():
             script.append(f"      {session_id}) printf '%s' '{document}' ;;")
-        script.append('      *) exit 1 ;;')
+        script.append('      *) echo "session not found" >&2; exit 1 ;;')
         script.append("    esac ;;")
         script.append(f"  search) printf '%s' '{matches}' ;;")
         script.append("  *) exit 1 ;;")
@@ -413,38 +441,174 @@ class AgentLauncherTest(unittest.TestCase):
         self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
         self.assertEqual(self.session_id(result), OMP_RESUME_ID)
 
-    def test_resume_refuses_a_session_belonging_to_another_agent(self) -> None:
-        # Rewriting the id anyway would hand omp a codex session and leave it
-        # to report a missing session, which says nothing about where to look.
-        self.install_real("omp")
-        self.install_python()
+    def test_named_session_switches_to_owning_harness(self) -> None:
+        """HarnessOwnership: direct launch resumes only through its owning harness."""
+        self.install_real("codex")
         self.install_session_name(CODEX_RESUME_ID, "Efficient Deer")
         self.install_agentsview({CODEX_RESUME_ID: "codex"})
         result = self.launch("omp", "--resume", "Efficient Deer")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("is a codex session", result.stderr)
-        self.assertIn(f"codex resume {CODEX_RESUME_ID}", result.stderr)
-        self.assertNotIn("args=", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=resume {CODEX_RESUME_ID}", result.stdout)
+        self.assertEqual(self.session_id(result), CODEX_RESUME_ID)
 
-    def test_an_unresolvable_resume_argument_reaches_the_agent_as_typed(self) -> None:
+    def test_unmatched_resume_never_executes_the_agent(self) -> None:
+        """RejectUnmatchedResume: authoritative name misses fail closed."""
         self.install_real("omp")
-        self.install_python()
         self.install_agentsview()
         result = self.launch("omp", "--resume", "no such session")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("args=--resume no such session", result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("No matching conversation", result.stderr)
+        self.assertNotIn("args=", result.stdout)
 
-    def test_a_native_id_is_resumed_without_any_lookup(self) -> None:
-        # Every guarded launch pays for what this path does, so an id the agent
-        # resolves itself must not reach the resolver at all.
+    def test_native_id_authoritatively_absent_is_not_attempted(self) -> None:
+        """RejectUnmatchedResume also rejects exact native identifiers."""
         self.install_real("omp")
-        self.install_python()
-        witness = self.tmp / "agentsview-calls"
-        self.install_agentsview(witness=witness)
+        self.install_agentsview()
+        result = self.launch("omp", "--resume", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("No matching conversation", result.stderr)
+        self.assertNotIn("args=", result.stdout)
+
+    def test_switch_translates_a_configured_native_model_flag(self) -> None:
+        """PrepareResumeModel maps the requested model into the owning harness."""
+        self.install_real("omp")
+        self.install_agentsview({OMP_RESUME_ID: "omp"})
+        result = self.launch("opencode", "-m", "zai-coding-plan/glm-5.3-flash", "-s", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=--model=zai/glm-5.3-flash --resume {OMP_RESUME_ID}", result.stdout)
+        self.assertNotIn("zai-coding-plan", result.stdout)
+
+    def test_switch_refuses_an_unsupported_native_model_unattended(self) -> None:
+        """PrepareResumeModel never drops an unsupported requested model."""
+        self.install_real("codex")
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+        result = self.launch("omp", "--model=zai/glm-5.3-flash", "--resume", CODEX_RESUME_ID)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("has no route", result.stderr)
+        self.assertNotIn("args=", result.stdout)
+
+    def test_nested_codex_identity_preserves_the_outer_receipt(self) -> None:
+        """InteractiveTopLevelReceiptsOnly recognizes native Codex nesting before identity reset."""
+        self.install_real("omp")
+        self.environment["CODEX_THREAD_ID"] = CODEX_RESUME_ID
+        self.environment["TERM_SESSION_ID"] = "nested-native"
+        card = self.tmp / "epilogue" / "nested-native.card"
+        card.parent.mkdir()
+        card.write_bytes(b"outer receipt\n")
+        status, output = run_pty(
+            [str(LAUNCHER_DIR / "omp")], self.environment, [], self.tmp / "executed",
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(card.read_bytes(), b"outer receipt\n")
+        self.assertIn("codex_thread=\r\n", output)
+
+    def test_current_exact_conversation_is_excluded_before_identity_reset(self) -> None:
+        """CurrentConversationExcluded holds even for direct native-ID invocations."""
+        self.install_real("omp")
+        self.environment["AGENT_SESSION_ID"] = OMP_RESUME_ID
+        result = self.launch("omp", "--resume", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("args=", result.stdout)
+
+    def test_interactive_switch_waits_for_model_choice(self) -> None:
+        """SelectCompatibleResumeModel/CancelResumeModelSelection use actual TTY input."""
+        self.install_real("codex")
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+        for choice, expected in (("q", 2), ("1", 0)):
+            with self.subTest(choice=choice):
+                status, output = run_pty(
+                    [str(LAUNCHER_DIR / "omp"), "--model=zai/glm-5.3-flash", "--resume", CODEX_RESUME_ID],
+                    self.environment, [choice], self.tmp / "executed",
+                )
+                self.assertEqual(status, expected, output)
+                if choice == "q":
+                    self.assertNotIn("args=", output)
+                else:
+                    self.assertIn(f"args=resume {CODEX_RESUME_ID}", output)
+                    self.assertIn(f"agent_session={CODEX_RESUME_ID}", output)
+                    self.assertIn("guards=1", output)
+
+    def test_interactive_cross_harness_selection_sets_actual_receipt_harness(self) -> None:
+        """PromptForCrossHarnessConflict, HarnessOwnership and ReceiptContents share the selection."""
+        self.install_real("omp")
+        self.install_real("codex")
+        self.install_agentsview(
+            {OMP_RESUME_ID: "omp", CODEX_RESUME_ID: "codex"},
+            found=[f"omp:{OMP_RESUME_ID}", f"codex:{CODEX_RESUME_ID}"],
+        )
+        self.environment["TERM_SESSION_ID"] = "resume-choice"
+        self.environment["AGENT_EPILOGUE_DIR"] = str(self.tmp / "epilogue")
+        card = self.tmp / "epilogue" / "resume-choice.card"
+        witness = self.tmp / "executed"
+        for choice, owner, native_id in (("q", None, None), ("1", "codex", CODEX_RESUME_ID), ("2", "omp", OMP_RESUME_ID)):
+            with self.subTest(choice=choice):
+                witness.unlink(missing_ok=True)
+                card.unlink(missing_ok=True)
+                status, output = run_pty(
+                    [str(LAUNCHER_DIR / "omp"), "--resume", "remembered line"],
+                    self.environment, [choice], witness,
+                )
+                self.assertEqual(status, 2 if owner is None else 0, output)
+                if owner is None:
+                    self.assertFalse(witness.exists())
+                    self.assertFalse(card.exists())
+                else:
+                    self.assertTrue(witness.exists())
+                    self.assertIn(f"agent_session={native_id}", output)
+                    receipt = subprocess.run(
+                        [str(REPO / "agent-epilogue"), *card.read_text().splitlines(), "--status", "0"],
+                        capture_output=True, text=True, env=self.environment, timeout=15,
+                    )
+                    self.assertEqual(receipt.returncode, 0, receipt.stderr)
+                    spelling = "--resume" if owner == "omp" else "resume"
+                    self.assertIn(f"{owner} {spelling} {native_id}", receipt.stdout)
+
+    def test_switch_to_claude_keeps_native_identity(self) -> None:
+        """IdentitySeparation holds when the owning harness is the external Claude wrapper."""
+        self.install_real("claude")
+        self.install_agentsview({OMP_RESUME_ID: "claude"})
         result = self.launch("omp", "--resume", OMP_RESUME_ID)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"args=--resume {OMP_RESUME_ID}", result.stdout)
-        self.assertFalse(witness.exists())
+        self.assertEqual(self.session_id(result), OMP_RESUME_ID)
+        self.assertIn("guards=1", result.stdout)
+
+    def test_switch_to_claude_leaves_receipt_to_its_native_wrapper(self) -> None:
+        """ReceiptAtMostOncePerRun delegates Claude's receipt to its existing owner."""
+        self.install_real("claude")
+        self.install_agentsview({OMP_RESUME_ID: "claude"})
+        self.environment["TERM_SESSION_ID"] = "claude-owner"
+
+        status, output = run_pty(
+            [str(LAUNCHER_DIR / "omp"), "--resume", OMP_RESUME_ID],
+            self.environment, [], self.tmp / "executed",
+        )
+
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"args=--resume {OMP_RESUME_ID}", output)
+        self.assertFalse((self.tmp / "epilogue" / "claude-owner.card").exists())
+
+    def test_resume_marker_after_double_dash_is_not_rewritten(self) -> None:
+        """LaunchEnvironment preserves ordinary argument semantics after --."""
+        self.install_real("omp")
+        self.install_agentsview()
+        result = self.launch("omp", "--", "--resume", OMP_RESUME_ID)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"args=-- --resume {OMP_RESUME_ID}", result.stdout)
+        self.assertNotEqual(self.session_id(result), OMP_RESUME_ID)
+
+    def test_switch_preserves_argument_boundaries_without_shell_evaluation(self) -> None:
+        """LaunchEnvironment: owning-harness translation treats arbitrary argv as data."""
+        real = self.real_bin / "codex"
+        real.write_text(f'#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        real.chmod(0o755)
+        self.install_agentsview({CODEX_RESUME_ID: "codex"})
+        marker = self.tmp / "should-not-exist"
+        prompt = f"two lines\n$(touch {marker})"
+        result = self.launch("omp", "--resume", CODEX_RESUME_ID, "--", prompt, "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["resume", CODEX_RESUME_ID, "--", prompt, ""])
+        self.assertFalse(marker.exists())
 
     def test_a_picker_selector_is_not_treated_as_a_name(self) -> None:
         self.install_real("codex")

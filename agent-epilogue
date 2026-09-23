@@ -60,7 +60,7 @@ fi
 
 # ---- how it ended -----------------------------------------------------------
 # Unlike Claude Code, these harnesses fire no end-of-session hook, so the exit
-# status the shell observed is the only account of how the session finished.
+# status the shell observed is the only account of how the process exited.
 ended="exited normally"
 if [[ -n "$status" && "$status" != "0" ]]; then
     if [[ "$status" -gt 128 ]]; then
@@ -72,7 +72,7 @@ if [[ -n "$status" && "$status" != "0" ]]; then
             *)  ended="killed by signal $sig" ;;
         esac
     else
-        ended="crashed (status $status)"
+        ended="exited with status $status"
     fi
 fi
 
@@ -102,11 +102,8 @@ printf '%s┌%s %s%s%s %s·%s %s\n' \
     "$C_RAIL" "$C_RESET" "$C_BOLD" "$project" "$C_RESET" "$C_DIM" "$C_RESET" "$subject"
 printf '%s│%s %s%s%s\n' "$C_RAIL" "$C_RESET" "$C_DIM" "$facts" "$C_RESET"
 
-# The name, not the id, is what resumes these. The launcher mints
-# AGENT_SESSION_ID for its own bookkeeping; the harness has never heard of it
-# and resolves only its own native id, so printing it would offer a command
-# that fails. The name resolves through agent-model's session lookup, which is
-# what the launcher's own --resume handling already calls.
+# A readable name is preferred. The card's id may instead be bookkeeping, so
+# offer it only after an exact native-identity and harness ownership check.
 resume_flag=""
 case "$harness" in
     kimi|omp)  resume_flag="--resume" ;;
@@ -115,9 +112,19 @@ case "$harness" in
     agy)       resume_flag="--conversation" ;;
 esac
 
-if [[ -n "$name" && -n "$resume_flag" ]]; then
-    printf '%s└%s %sresume%s  %s %s "%s"\n' \
-        "$C_RAIL" "$C_RESET" "$C_DIM" "$C_RESET" "$harness" "$resume_flag" "$name"
+resume_target="$name"
+if [[ -z "$resume_target" && -n "$session_id" && -n "$resume_flag" ]]; then
+    verified="$("$REPO_DIR/launchers/agent-model" verify-session "$session_id" --agent "$harness" 2>/dev/null)" || verified=""
+    if [[ "$verified" == "$session_id"$'\n'"$harness" ]]; then
+        resume_target="$session_id"
+    fi
+fi
+
+if [[ -n "$resume_target" && -n "$resume_flag" ]]; then
+    # %q is shell syntax, not decorative quotes: names can contain quotes,
+    # substitutions or other metacharacters that must remain literal.
+    printf '%s└%s %sresume%s  %s %s %q\n' \
+        "$C_RAIL" "$C_RESET" "$C_DIM" "$C_RESET" "$harness" "$resume_flag" "$resume_target"
 else
     printf '%s└%s\n' "$C_RAIL" "$C_RESET"
 fi

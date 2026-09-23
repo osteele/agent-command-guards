@@ -11,9 +11,13 @@ import hashlib
 import json
 import os
 import re
+import select
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -22,8 +26,10 @@ REPO = Path(__file__).resolve().parent.parent
 AGENT_MAIL_NAME = REPO / "agent-mail-name"
 AGENT_EPILOGUE = REPO / "agent-epilogue"
 AGENT_LAUNCHER = REPO / "agent-launcher"
+EPILOGUE_HOOK = REPO / "shell" / "epilogue.zsh"
+NATIVE_ID = "01234567-89ab-cdef-0123-456789abcdef"
 
-ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def plain(text: str) -> str:
@@ -42,6 +48,15 @@ class ReceiptTestCase(unittest.TestCase):
             directory.mkdir(parents=True, exist_ok=True)
         self.environment = dict(os.environ)
         self.environment["HOME"] = str(self.home)
+        # External lookup must never reach the workstation's live archive.
+        self.bin_dir = self.tmp / "bin"
+        self.bin_dir.mkdir()
+        if os.name == "posix":
+            (self.bin_dir / "python3").symlink_to(sys.executable)
+        agentsview = self.bin_dir / "agentsview"
+        agentsview.write_text("#!/bin/sh\nexit 1\n")
+        agentsview.chmod(0o755)
+        self.environment["PATH"] = f"{self.bin_dir}:{os.defpath}"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -83,14 +98,38 @@ class ReceiptTestCase(unittest.TestCase):
             json.dumps({"pid": host_pid + 1, "parentPid": host_pid, "sessionId": session_id})
         )
 
+    def write_native_session(self) -> None:
+        directory = self.home / ".omp" / "agent" / "sessions" / "project"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"2026-09-23T00-00-00-000Z_{NATIVE_ID}.jsonl").write_text("{}\n")
+
     def resolve(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(AGENT_MAIL_NAME), *arguments],
             capture_output=True,
             check=False,
             text=True,
+            timeout=5,
             env=self.environment,
         )
+
+    def resume_arguments(self, output: str, harness: str) -> list[str]:
+        """Execute the displayed shell command against an external fake harness."""
+        command = next(
+            line.split("resume  ", 1)[1]
+            for line in plain(output).splitlines()
+            if "resume  " in line
+        )
+        fake = self.bin_dir / harness
+        fake.write_text(
+            f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n"
+        )
+        fake.chmod(0o755)
+        result = subprocess.run(
+            ["bash", "-c", command], env=self.environment, cwd=self.tmp,
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        return json.loads(result.stdout)
 
     def render(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -99,6 +138,7 @@ class ReceiptTestCase(unittest.TestCase):
             check=False,
             text=True,
             env=self.environment,
+            timeout=10,
         )
 
 
@@ -166,29 +206,82 @@ class NameLookupTest(ReceiptTestCase):
         result = self.resolve("--host-pid", "5150")
         self.assertEqual(result.stdout.strip(), "Amber Ember")
 
+    def test_stale_breadcrumb_cannot_fall_through_to_old_registry(self) -> None:
+        """ReceiptContents: pid reuse cannot attribute a previous run's name."""
+        self.write_name("older", "Wrong Session")
+        self.write_breadcrumb(4242, "older", "Wrong Session", "2026-09-16T10:00:00Z")
+        self.write_registration(4242, "older")
+        result = self.resolve(
+            "--host-pid", "4242", "--not-before", "2026-09-17T04:00:00Z"
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, "")
+
+    def test_undated_breadcrumb_does_not_establish_launch_identity(self) -> None:
+        """ReceiptContents: a host-pid name requires evidence newer than launch."""
+        for recorded_at in ("", "not-a-time"):
+            with self.subTest(recorded_at=recorded_at):
+                self.write_breadcrumb(4242, "older", "Wrong Session", recorded_at)
+                result = self.resolve(
+                    "--host-pid", "4242", "--not-before", "2026-09-17T04:00:00Z"
+                )
+                self.assertEqual(result.returncode, 3)
+
+    def test_invalid_utf8_degrades_to_no_name(self) -> None:
+        """ReceiptContents: corrupt name data cannot break the exit receipt."""
+        digest = hashlib.sha256(b"broken").hexdigest()
+        (self.store / f"{digest}.json").write_bytes(b"\xff")
+        result = self.resolve("--session-id", "broken")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stderr, "")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX named pipes")
+    def test_stalled_name_store_cannot_hold_the_prompt(self) -> None:
+        """ReceiptContents: unavailable name storage has a bounded no-name outcome."""
+        digest = hashlib.sha256(b"stalled").hexdigest()
+        os.mkfifo(self.store / f"{digest}.json")
+        result = self.resolve("--session-id", "stalled")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stderr, "")
+
 
 class EpilogueRenderTest(ReceiptTestCase):
     def test_names_the_session_and_offers_a_resume_by_name(self) -> None:
-        """The name, not the id: the launcher's AGENT_SESSION_ID is its own
-        bookkeeping, and the harness resolves only its native id."""
-        self.write_name("abc-123", "Flying Cake")
+        """ShowExitReceipt: a readable name takes precedence over native identity."""
+        self.write_native_session()
+        self.write_name(NATIVE_ID, "Flying Cake")
         result = self.render(
-            "--harness", "kimi", "--cwd", "/tmp/my-project",
-            "--session-id", "abc-123", "--status", "0",
+            "--harness", "omp", "--cwd", "/tmp/my-project",
+            "--session-id", NATIVE_ID, "--status", "0",
         )
         output = plain(result.stdout)
         self.assertIn("my-project", output)
         self.assertIn("Flying Cake", output)
-        self.assertIn('kimi --resume "Flying Cake"', output)
+        self.assertEqual(self.resume_arguments(result.stdout, "omp"), ["--resume", "Flying Cake"])
 
-    def test_unnamed_session_renders_without_a_resume_line(self) -> None:
-        result = self.render("--harness", "kimi", "--cwd", "/tmp/p", "--session-id", "x")
+    def test_unverified_native_shaped_id_has_no_resume_line(self) -> None:
+        """IdentitySeparation: UUID shape does not prove native resumability."""
+        result = self.render("--harness", "kimi", "--cwd", "/tmp/p", "--session-id", NATIVE_ID)
         output = plain(result.stdout)
         self.assertIn("(unnamed session)", output)
         self.assertNotIn("resume", output)
 
+    def test_unnamed_verified_native_id_is_runnable(self) -> None:
+        """ShowExitReceipt, IdentitySeparation: exact positive evidence permits ID fallback."""
+        self.write_native_session()
+        result = self.render("--harness", "omp", "--session-id", NATIVE_ID)
+        self.assertEqual(self.resume_arguments(result.stdout, "omp"), ["--resume", NATIVE_ID])
+
+    def test_native_id_owned_by_other_harness_is_not_offered(self) -> None:
+        """ReceiptContents: evidence for another harness cannot authorize this resume command."""
+        self.write_native_session()
+        result = self.render("--harness", "kimi", "--session-id", NATIVE_ID)
+        self.assertNotIn("resume  ", plain(result.stdout))
+
     def test_resume_spelling_follows_the_harness(self) -> None:
-        self.write_name("abc-123", "Flying Cake")
+        """ReceiptContents: displayed commands preserve literal names and owning syntax."""
+        name = "Flying 'Cake' \"$(touch injected)\" `echo nope` $HOME ; *"
+        self.write_name("abc-123", name)
         for harness, flag in (
             ("kimi", "--resume"),
             ("omp", "--resume"),
@@ -200,12 +293,14 @@ class EpilogueRenderTest(ReceiptTestCase):
                 result = self.render(
                     "--harness", harness, "--cwd", "/tmp/p", "--session-id", "abc-123"
                 )
-                self.assertIn(f'{harness} {flag} "Flying Cake"', plain(result.stdout))
+                self.assertEqual(self.resume_arguments(result.stdout, harness), [flag, name])
+                self.assertFalse((self.tmp / "injected").exists())
 
     def test_exit_status_becomes_how_it_ended(self) -> None:
+        """ReceiptContents: report process outcome, never claim task completion."""
         for status, expected in (
             ("0", "exited normally"),
-            ("1", "crashed (status 1)"),
+            ("1", "exited with status 1"),
             ("130", "interrupted (Ctrl-C)"),
             ("137", "killed (SIGKILL)"),
             ("143", "terminated (SIGTERM)"),
@@ -220,18 +315,13 @@ class EpilogueRenderTest(ReceiptTestCase):
         self.assertEqual(self.render("--cwd", "/tmp/p").returncode, 2)
 
 
+@unittest.skipUnless(os.name == "posix", "receipt launch requires POSIX terminals")
 class LauncherCardTest(ReceiptTestCase):
-    """The card the launcher leaves for the shell to render.
-
-    The launcher execs its agent, so the card is the only thing that survives
-    the launch -- these tests run it with a fake agent binary and read what it
-    wrote on the way past.
-    """
-
-    def launch(self, harness: str, **overrides: str) -> tuple[Path, subprocess.CompletedProcess[str]]:
-        bin_dir = self.tmp / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        fake = bin_dir / harness
+    def launch(
+        self, harness: str, *arguments: str, input_tty: bool = True,
+        output_tty: bool = True, **overrides: str,
+    ) -> tuple[Path, subprocess.CompletedProcess[str]]:
+        fake = self.bin_dir / harness
         fake.write_text("#!/bin/bash\nexit 0\n")
         fake.chmod(0o755)
         link = self.tmp / harness
@@ -239,60 +329,164 @@ class LauncherCardTest(ReceiptTestCase):
             link.symlink_to(AGENT_LAUNCHER)
         cards = self.tmp / "cards"
         environment = dict(self.environment)
-        environment["PATH"] = f"{bin_dir}:{os.defpath}"
         environment["AGENT_EPILOGUE_DIR"] = str(cards)
         environment["TERM_SESSION_ID"] = "w1t1p0_TEST"
         for marker in (
-            "AGENT_COMMAND_GUARDS_ACTIVE",
-            "CLAUDECODE",
-            "CLAUDE_CODE_SESSION_ID",
-            "AGENT_SESSION_ID",
-            "GEMINI_CLI",
+            "AGENT_COMMAND_GUARDS_ACTIVE", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+            "AGENT_SESSION_ID", "CODEX_THREAD_ID", "GEMINI_CLI",
         ):
             environment.pop(marker, None)
         environment.update(overrides)
-        # A pty, because the launcher writes a card only for a real terminal:
-        # a scripted invocation has no prompt to print one at.
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                "import pty,sys;sys.exit(pty.spawn(sys.argv[1:]))",
-                str(link),
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-            env=environment,
-            cwd=str(self.tmp),
-        )
+        master, slave = os.openpty()
+        try:
+            result = subprocess.run(
+                [str(link), *arguments],
+                stdin=slave if input_tty else subprocess.DEVNULL,
+                stdout=slave if output_tty else subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=environment,
+                cwd=str(self.tmp), timeout=15, check=False,
+            )
+        finally:
+            os.close(slave)
+            os.close(master)
+        self.assertEqual(result.returncode, 0, result.stderr)
         return cards / "w1t1p0_TEST.card", result
 
-    def test_card_carries_the_launch_facts(self) -> None:
+    def test_top_level_launch_renders_project_harness_and_outcome(self) -> None:
+        """ShowExitReceipt, ShellReceipt: the actual launch yields usable receipt context."""
         card, _ = self.launch("kimi")
-        self.assertTrue(card.exists(), "launcher wrote no card")
-        fields = card.read_text().splitlines()
-        self.assertEqual(fields[0], "--harness")
-        self.assertEqual(fields[1], "kimi")
-        pairs = dict(zip(fields[::2], fields[1::2]))
-        # macOS hands a process the resolved /private form of a temp path.
-        self.assertEqual(Path(pairs["--cwd"]).resolve(), self.tmp.resolve())
-        self.assertTrue(pairs["--session-id"])
-        self.assertTrue(pairs["--host-pid"].isdigit())
-        self.assertTrue(pairs["--started"].isdigit())
-        self.assertRegex(pairs["--recorded-at"], r"^\d{4}-\d{2}-\d{2}T")
+        result = self.render(*card.read_text().splitlines(), "--status", "7")
+        output = plain(result.stdout)
+        self.assertIn(self.tmp.name, output)
+        self.assertIn("kimi", output)
+        self.assertIn("status 7", output)
+        self.assertRegex(output, r"\d+[smh]")
 
-    def test_a_nested_launch_leaves_no_card(self) -> None:
-        """One terminal, one card. An agent started inside another agent's
-        shell would otherwise overwrite the card its host is waiting on."""
-        card, _ = self.launch("kimi", AGENT_COMMAND_GUARDS_ACTIVE="1")
-        self.assertFalse(card.exists())
-
-    def test_the_card_renders(self) -> None:
+    def test_nested_launch_preserves_outer_receipt(self) -> None:
+        """InteractiveTopLevelReceiptsOnly: a nested launch cannot replace the outer card."""
         card, _ = self.launch("kimi")
-        arguments = card.read_text().splitlines()
-        result = self.render(*arguments, "--status", "0")
-        self.assertIn("exited normally", plain(result.stdout))
+        outer = card.read_bytes()
+        nested, _ = self.launch("codex", AGENT_COMMAND_GUARDS_ACTIVE="1")
+        self.assertEqual(nested.read_bytes(), outer)
+
+    def test_noninteractive_launch_publishes_no_card(self) -> None:
+        """InteractiveTopLevelReceiptsOnly: both input and output must be interactive."""
+        for input_tty, output_tty in ((False, False), (False, True), (True, False)):
+            with self.subTest(input_tty=input_tty, output_tty=output_tty):
+                card, _ = self.launch("kimi", input_tty=input_tty, output_tty=output_tty)
+                self.assertFalse(card.exists())
+
+    def test_headless_mode_with_terminal_publishes_no_card(self) -> None:
+        """InteractiveTopLevelReceiptsOnly: a PTY does not make headless execution interactive."""
+        for harness, arguments in (
+            ("codex", ("exec", "a prompt")), ("omp", ("--print", "a prompt")),
+            ("opencode", ("run", "a prompt")), ("kimi", ("--print", "a prompt")),
+            ("codex", ("review",)), ("omp", ("--mode", "rpc")),
+            ("kimi", ("--help",)),
+        ):
+            with self.subTest(harness=harness):
+                card, _ = self.launch(harness, *arguments)
+                self.assertFalse(card.exists())
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("zsh"), "requires interactive Zsh")
+class ZshPromptReceiptTest(ReceiptTestCase):
+    """Exercise Zsh's actual precmd dispatch, not ordinary function calls."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import termios
+
+        self.cards = self.tmp / "cards"
+        self.cards.mkdir()
+        self.card = self.cards / "receipt-test.card"
+        self.environment.update(
+            AGENT_EPILOGUE_DIR=str(self.cards), TERM_SESSION_ID="receipt-test",
+            TERM="dumb", ZDOTDIR=str(self.home),
+        )
+        self.master, slave = os.openpty()
+        settings = termios.tcgetattr(slave)
+        settings[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, settings)
+        self.shell = subprocess.Popen(
+            ["zsh", "-dfi"], stdin=slave, stdout=slave, stderr=slave,
+            env=self.environment, cwd=self.tmp, start_new_session=True,
+        )
+        os.close(slave)
+        self.addCleanup(self.close_shell)
+        self.command("PS1='RECEIPT-'\"READY> \"; RPS1=''")
+        self.command(
+            f"source {shlex.quote(str(EPILOGUE_HOOK))}; "
+            f"source {shlex.quote(str(EPILOGUE_HOOK))}; "
+            "STARSHIP_CMD_STATUS=42; setopt pipefail"
+        )
+
+    def close_shell(self) -> None:
+        if self.shell.poll() is None:
+            self.shell.terminate()
+        try:
+            self.shell.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.shell.kill()
+            self.shell.wait(timeout=3)
+        os.close(self.master)
+
+    def command(self, command: str) -> str:
+        os.write(self.master, (command + "\n").encode())
+        output = bytearray()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self.master], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+            rendered = ESCAPE.sub("", output.decode(errors="replace"))
+            if rendered.endswith("RECEIPT-READY> "):
+                return rendered
+        self.fail(f"interactive Zsh did not return its prompt: {output!r}")
+
+    def publish_card(self) -> None:
+        self.card.write_text("--harness\nkimi\n--cwd\n/tmp/receipt-project\n")
+
+    def test_hook_consumes_once_and_preserves_failed_pipeline(self) -> None:
+        """ReceiptAtMostOncePerRun, ReceiptContents: preserve $?/pipestatus across real prompts."""
+        self.command(
+            'observe() { print -r -- "OBSERVER:$?:${(j:,:)pipestatus}"; }; '
+            'precmd_functions=(observe _agent_epilogue)'
+        )
+        self.publish_card()
+        first = self.command("(exit 7) | (exit 0)")
+        self.assertIn("status 7", plain(first))
+        self.assertIn("OBSERVER:7:7,0", first)
+        self.assertEqual(plain(first).count("receipt-project"), 1)
+        self.assertFalse(self.card.exists())
+        second = self.command('print -r -- "AFTER:$?:${(j:,:)pipestatus}"')
+        self.assertIn("AFTER:7:7,0", second)
+        self.assertNotIn("receipt-project", second)
+
+    def test_failed_renderer_cannot_change_status_or_reprint_card(self) -> None:
+        """ReceiptAtMostOncePerRun, ReceiptContents: renderer failure is not command failure."""
+        self.command("_AGENT_EPILOGUE_RENDERER=/usr/bin/false")
+        self.publish_card()
+        self.command("(exit 0) | (exit 9)")
+        self.assertFalse(self.card.exists())
+        output = self.command('print -r -- "AFTER:$?:${(j:,:)pipestatus}"')
+        self.assertIn("AFTER:9:0,9", output)
+        self.assertNotIn("receipt-project", output)
+
+    def test_successful_exit_receipt_leaves_successful_pipeline(self) -> None:
+        """ReceiptContents: a normal process exit remains success, not a task-completion claim."""
+        self.publish_card()
+        first = self.command("(exit 0) | (exit 0)")
+        self.assertIn("exited normally", plain(first))
+        output = self.command('print -r -- "AFTER:$?:${(j:,:)pipestatus}"')
+        self.assertIn("AFTER:0:0,0", output)
 
 
 if __name__ == "__main__":

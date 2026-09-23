@@ -110,12 +110,10 @@ The short form is consumed only when the next word is a known harness or the
 word, remains the selected harness's help option. `--harness` reports an unknown
 value as an error.
 
-Use `--resume SESSION` with every model-first command. The launcher translates
-it to the selected harness's syntax (`resume`, `--resume`, or `--session`). When
-no harness is explicit, AgentsView-prefixed identifiers and distinctive Kimi
-and OpenCode identifier shapes select their native harness. Other identifiers
-are resolved through AgentsView when it is available; an unknown identifier
-uses the configured default harness.
+Use `--resume SESSION` with every model-first command. The selected conversation
+determines the harness, and the launcher translates the request to that harness's
+syntax (`resume`, `--resume`, or `--session`). Exact IDs are checked against local
+session stores and AgentsView; an identifier's shape alone does not establish its owner.
 
 `SESSION` does not have to be an identifier. The agent launchers accept the same
 three forms, so `omp --resume "Efficient Deer"` works as well as
@@ -136,15 +134,23 @@ Transcript text is matched against AgentsView's index of message text, not tool
 arguments or tool output. The session you are typing in is never a candidate: the
 phrase you type to find an old session lands in the current session's transcript.
 
-When several sessions match, the newest wins and the others are named on stderr
-with their ids, so a different one can be selected by id. An explicit harness
-narrows the search to that harness's sessions first. Nothing that resolves as a
-native session id is looked up at all, so an ordinary resume costs nothing.
+The newest matching conversation is the default, with alternatives listed on
+stderr by ID. An explicit harness sets a preference:
 
-Resolution needs `launchers/agent-model`, and therefore a `python3` on `PATH`
-that satisfies its 3.11 floor. A query that resolves to another agent's session
-is refused with the command that would work, rather than handed to an agent that
-cannot open it. A query that resolves to nothing reaches the agent as typed.
+- If a newer match belongs to another harness, an interactive launch prompts
+  for a choice. An unattended launch selects the newest match in the requested harness.
+- If the requested harness has no match, the launcher switches to the newest
+  matching conversation's owner.
+
+A switch that leaves the requested model without a configured route prompts an
+interactive caller to select a compatible model. Unattended launches fail with
+an error instead of substituting a saved or default model.
+
+A conclusive miss produces a launcher error. When lookup is unavailable, an
+exact native ID can be attempted using the invocation's selected harness.
+Names and transcript queries require a resolved conversation; unresolved text
+is never sent to a provider as a resume ID. Resolution requires
+`launchers/agent-model` and Python 3.11 or later.
 
 Defaults come from `agent-models.toml` at the repository root. Each command
 names its native harness as `home` — what `--harness own`, `--harness self`, and
@@ -283,21 +289,25 @@ shell prompt prints a receipt naming it by its agent-mail name:
 ```
 ┌ llm-performance-models · Flying Cake
 │ 42m · kimi · exited normally
-└ resume  kimi --resume "Flying Cake"
+└ resume  kimi --resume Flying\ Cake
 ```
 
-The resume line offers the name rather than a session id. `AGENT_SESSION_ID` is
-the launcher's own bookkeeping and no harness can resolve it; the name resolves
-through the same lookup the launcher's own `--resume` handling uses.
+The resume command prefers the session's readable name. Without a name, it
+offers a native ID only after verifying that the owning harness recognizes
+that exact identity. A launcher bookkeeping ID does not establish this.
+If neither identity is available, the receipt has no resume command.
 
-A session that never attached agent-mail has no name, and the receipt renders
-without one. Claude Code prints its own receipt through `claude-wrapper`, which
-names the session the same way.
+Receipts describe the project, actual harness, elapsed time, and process exit
+status. A successful process exit does not claim that its task was completed.
+The shell consumes each card once and preserves the command and pipeline statuses.
 
-Set `AGENT_LAUNCHER_NICE`'s neighbour `AGENT_EPILOGUE_DIR` to move the card
-directory (default `~/.cache/agent-command-guards/epilogue`). Nested launches —
-an agent started inside another agent's session — write no card, so one terminal
-never overwrites the receipt another agent is waiting to print.
+Both input and output must be terminals. Headless, diagnostic, and nested
+launches write no card, so they cannot overwrite an outer interactive session's
+receipt. Claude Code's separate wrapper owns its receipt, including when a
+resume request switches to Claude.
+
+Set `AGENT_EPILOGUE_DIR` to move the card directory
+(default `~/.cache/agent-command-guards/epilogue`).
 
 The reader is a Zsh `precmd` hook installed by `launchers/setup` into
 `~/.config/agent-launchers/env`. Bash gets no receipt: there is no equivalent
@@ -323,23 +333,34 @@ host answers. When it does not answer, a macOS dialog asks whether to continue.
 "Yes" proceeds, on the assumption the user is about to change networks. "No"
 prints an error and exits.
 
+Concurrent requests for the same unreachable host share one outstanding dialog
+and its answer. A caller without its own dialog can join an existing one.
+Approval applies to that group; a later request probes and asks again if needed.
+A missing, failed, or timed-out dialog refuses the command without recording a
+user decline.
+
 A "No" is remembered per host, so a second attempt fails immediately instead of
 asking again. The decision is cleared as soon as a probe succeeds. A host that was
 reachable and no longer is gets a fresh dialog rather than the remembered answer,
 since that pattern indicates a network change rather than a standing decision.
 
-State lives in `~/.cache/agent-command-guards/state.json`, written under
-`fcntl.flock` so concurrent agents do not corrupt it:
+State lives in `~/.cache/agent-command-guards/state.json`, written under a
+process-shared file lock:
 
 ```json
 {
   "beta": {
     "declined": false,
     "last_checked": "2025-12-30T14:23:51.657123+00:00",
-    "was_accessible": true
+    "was_accessible": true,
+    "pending_confirmation": null
   }
 }
 ```
+
+Outstanding dialogs also use temporary per-host confirmation files in that
+directory. An abandoned owner releases its waiting callers with an unavailable
+result.
 
 ### git
 
@@ -357,12 +378,19 @@ working copy. jj keeps Git's `HEAD` detached at the working-copy parent, so
 stale Git state, without creating a synthetic jj bookmark. Mutating branch
 forms and commands such as `git checkout`, `git reset`, and `git clean` are
 refused instead of falling through to Git.
+A synchronization failure prevents the Git read from running against stale state.
+
+`git add` succeeds without staging; jj tracks the working copy. `git commit`
+maps to `jj commit`, while `git commit --amend` describes the current jj change.
+Git-only commit flags are omitted, and message text remains literal even when
+it spells an option.
 
 `git worktree` add, list, remove, and prune map to the corresponding `jj
 workspace` operations. Removal resolves the exact registered workspace path and
 refuses to touch the primary workspace, the current one, a symlink, or a path that
-is merely similar. A workspace holding changes or untracked files survives unless
-`-f` is supplied.
+is merely similar. These target checks apply even with `-f`, including a symlink
+with a trailing directory separator. Changes, untracked files, and ignored
+files prevent removal unless `-f` is supplied.
 
 ### uv, just, and with-limits
 
@@ -438,8 +466,14 @@ The suite uses `unittest`. It drives the real wrappers as subprocesses against
 temporary repositories and fake binaries, so it exercises the files that agents
 actually run.
 
+The policies are specified in [`agent-launch.allium`](specs/agent-launch.allium)
+and [`command-guards.allium`](specs/command-guards.allium). Regression test
+docstrings identify the rules and invariants they exercise. Terminal tests cover
+selection, cancellation, and shell status preservation; controlled dialog
+subprocesses exercise shared answers and owner failure across concurrent callers.
+
 CI runs it on Linux, macOS, and Windows across Python 3.11–3.14. Windows runs
-the portable suites (parsers, state, size parsing, mocked monitors); suites that
-need POSIX shells, `which(1)`, process groups, or memory monitors skip there
+the portable parser, state, and configuration tests; suites that
+need POSIX shells, terminal emulation, `which(1)`, process groups, or memory monitors skip there
 with their reason. Linux and macOS jobs install `jj` from its latest release so
 the git-shadow tests run against a real repository backend.

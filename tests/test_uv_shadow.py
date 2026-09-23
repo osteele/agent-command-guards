@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,7 +25,7 @@ requires_guard = unittest.skipUnless(
 )
 
 
-@requires_guard
+@unittest.skipIf(os.name == "nt", "uv integration fixtures require POSIX executable scripts")
 class UvShadowIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -51,6 +52,8 @@ class UvShadowIntegrationTest(unittest.TestCase):
         )
         for name in (
             "WITH_LIMITS_ACTIVE",
+            "LLM_RAM_GUARD",
+            "LLM_RAM_GUARD_ACTIVE",
             "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
             "PYTORCH_MPS_LOW_WATERMARK_RATIO",
         ):
@@ -59,6 +62,7 @@ class UvShadowIntegrationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    @requires_guard
     def test_uv_run_is_guarded(self) -> None:
         result = subprocess.run(
             [str(UV_SHADOW), "run", "python", "experiment.py"],
@@ -72,6 +76,7 @@ class UvShadowIntegrationTest(unittest.TestCase):
         self.assertIn("active=1", result.stdout)
         self.assertIn("high=0.7", result.stdout)
 
+    @requires_guard
     def test_uv_run_after_global_options_is_guarded(self) -> None:
         for args in (
             ["--quiet", "run", "python", "experiment.py"],
@@ -108,6 +113,48 @@ class UvShadowIntegrationTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("active=", result.stdout)
                 self.assertNotIn("active=1", result.stdout)
+
+    def test_missing_guard_warns_before_child_and_preserves_failure(self) -> None:
+        """WarnAndRunWhenMemoryGuardMissing is fail-open, visibly and in order."""
+        self.real_uv.write_text("#!/bin/sh\nprintf 'child-started\\n' >&2\nexit 37\n")
+        environment = {
+            **self.environment,
+            "PATH": f"{SHADOWS}:{self.shim_bin}:{self.real_bin}:/usr/bin:/bin",
+        }
+        for name in ("LLM_RAM_GUARD", "WITH_LIMITS_ACTIVE", "LLM_RAM_GUARD_ACTIVE"):
+            environment.pop(name, None)
+
+        result = subprocess.run(
+            [sys.executable, str(UV_SHADOW), "run", "python", "experiment.py"],
+            capture_output=True, env=environment, text=True, timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 37)
+        self.assertIn("UNGUARDED", result.stderr)
+        self.assertIn("child-started", result.stderr)
+        self.assertLess(result.stderr.index("UNGUARDED"), result.stderr.index("child-started"))
+
+    def test_enclosing_guard_prevents_a_second_monitor(self) -> None:
+        """DelegateWithoutAdditionalMemoryGuard preserves the owned outer guard."""
+        guard = self.real_bin / "with-limits"
+        guard.write_text("#!/bin/sh\nprintf 'unexpected-second-monitor\\n' >&2\nexit 99\n")
+        guard.chmod(0o755)
+        self.real_uv.write_text("#!/bin/sh\nexit 37\n")
+        for active in ("WITH_LIMITS_ACTIVE", "LLM_RAM_GUARD_ACTIVE"):
+            with self.subTest(active=active):
+                environment = {
+                    **self.environment,
+                    "PATH": f"{SHADOWS}:{self.real_bin}:/usr/bin:/bin",
+                    active: "1",
+                }
+                environment.pop("LLM_RAM_GUARD", None)
+                result = subprocess.run(
+                    [sys.executable, str(UV_SHADOW), "run", "python", "experiment.py"],
+                    capture_output=True, env=environment, text=True, timeout=30,
+                )
+
+                self.assertEqual(result.returncode, 37, result.stderr)
+                self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":

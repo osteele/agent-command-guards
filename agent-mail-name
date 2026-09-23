@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+from datetime import datetime
+import signal
 import sys
 from pathlib import Path
 
@@ -41,8 +42,11 @@ def _load(path: Path) -> dict[str, object] | None:
     """Parse one JSON record, or None. Absent, unreadable, and malformed are
     all the same answer here: this cannot be the thing that fails."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        with path.open(encoding="utf-8") as stream:
+            text = stream.read(65537)
+        if len(text) > 65536:
+            return None
+    except (OSError, UnicodeError):
         return None
     try:
         record = json.loads(text)
@@ -72,7 +76,7 @@ def _breadcrumb(host_pid: int, directory: Path = BREADCRUMB_DIR) -> dict[str, ob
     return _load(directory / f"{host_pid}.json")
 
 
-def _to_second(timestamp: str) -> str:
+def _to_second(timestamp: str) -> datetime | None:
     """An ISO timestamp truncated to the second, for ordering two of them.
 
     The two sides are written by different programs: agent-mail records
@@ -81,8 +85,11 @@ def _to_second(timestamp: str) -> str:
     actually agree on, and a breadcrumb written in the same second as the
     launch is not stale.
     """
-    head, _, _ = timestamp.partition(".")
-    return head.rstrip("Z")
+    try:
+        value = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    return value.replace(microsecond=0) if value.tzinfo is not None else None
 
 
 def _registry_session(host_pid: int, directory: Path = REGISTRY_DIR) -> str | None:
@@ -127,20 +134,23 @@ def name_for_host_pid(
     record = _breadcrumb(host_pid, breadcrumbs)
     if record is not None:
         recorded = record.get("recordedAt")
-        stale = (
-            not_before is not None
-            and isinstance(recorded, str)
-            and _to_second(recorded) < _to_second(not_before)
-        )
-        if not stale:
-            name = _display_name(record)
-            if name:
-                return name
-            session_id = record.get("sessionId")
-            if isinstance(session_id, str):
-                resolved = name_for_session(session_id, store)
-                if resolved:
-                    return resolved
+        # Without a valid timestamp a reused pid cannot establish ownership of
+        # this launch. Do not bypass a stale breadcrumb through the registry.
+        if not_before is not None:
+            recorded_second = _to_second(recorded) if isinstance(recorded, str) else None
+            started_second = _to_second(not_before)
+            if recorded_second is None or started_second is None or recorded_second < started_second:
+                return None
+        name = _display_name(record)
+        if name:
+            return name
+        session_id = record.get("sessionId")
+        if isinstance(session_id, str):
+            resolved = name_for_session(session_id, store)
+            if resolved:
+                return resolved
+    if not_before is not None:
+        return None
     session_id = _registry_session(host_pid, registry)
     return name_for_session(session_id, store) if session_id else None
 
@@ -180,5 +190,20 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+class _LookupTimeout(Exception):
+    pass
+
+
+def _lookup_timed_out(signum: int, frame: object) -> None:
+    raise _LookupTimeout
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    # A receipt must not hold up the next prompt, even on a stalled filesystem.
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _lookup_timed_out)
+        signal.alarm(2)
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except _LookupTimeout:
+        sys.exit(NO_NAME)

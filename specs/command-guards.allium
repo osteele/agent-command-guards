@@ -1,0 +1,437 @@
+-- allium: 3
+-- Scope: Admission and translation of commands issued through the agent guards.
+-- Includes: Managed-host connections, jj-aware Git, and uv memory-guard dispatch.
+-- Excludes: Harness launch/resume (agent-launch.allium), network implementation,
+-- jj internals, and the implementation of the external with-limits monitor.
+-- Authority: Elicitation on 2026-09-23. Sections labeled baseline retain documented
+-- behavior from README.md and project guidance; implementation parity is not implied.
+
+external entity Caller {}
+
+-- The local configuration identifies managed hosts; the confirmation service
+-- reports inability to obtain an answer independently of a user decline.
+external entity GuardEnvironment {}
+
+external entity Host {
+    name: String
+    managed: Boolean
+}
+
+external entity ConnectionRequest {
+    caller: Caller
+    host: Host
+    confirmation_available: Boolean
+}
+
+external entity ProbeResult {
+    attempt: ConnectionAttempt
+    reachable: Boolean
+}
+
+-- Git classification includes leading global options and the effective repository.
+-- read includes only allowlisted read forms; workspace_remove has its own rule.
+external entity GitRequest {
+    colocated_jj: Boolean
+    operation: read | add | commit | amend | workspace_add | workspace_list |
+        workspace_prune | workspace_remove | unclassified
+    exact_registered_root: Boolean
+    primary_workspace: Boolean
+    current_workspace: Boolean
+    symlink_target: Boolean
+    has_changes: Boolean
+    has_untracked_files: Boolean
+    has_ignored_files: Boolean
+    force: Boolean
+
+    protected_target: not exact_registered_root or primary_workspace or
+        current_workspace or symlink_target
+    has_protected_data: has_changes or has_untracked_files or has_ignored_files
+}
+
+external entity MemoryGuardRequest {
+    is_uv_run: Boolean
+    bypass_requested: Boolean
+    enclosing_guard_active: Boolean
+    guard_available: Boolean
+}
+
+-- One shared record per managed host, independent of the requesting agent session.
+entity HostDecision {
+    host: Host
+    declined: Boolean
+    was_accessible: Boolean
+
+    pending_confirmation: HostConfirmation with decision = this and status = pending
+}
+
+entity ConnectionAttempt {
+    request: ConnectionRequest
+    decision: HostDecision
+    confirmation: HostConfirmation?
+    status: probing | awaiting_confirmation | allowed | refused
+
+    transitions status {
+        probing -> awaiting_confirmation
+        probing -> allowed
+        probing -> refused
+        awaiting_confirmation -> allowed
+        awaiting_confirmation -> refused
+        terminal: allowed, refused
+    }
+}
+
+entity HostConfirmation {
+    decision: HostDecision
+    initiator: ConnectionRequest
+    status: pending | accepted | declined | unavailable
+
+    attempts: ConnectionAttempt with confirmation = this
+
+    transitions status {
+        pending -> accepted
+        pending -> declined
+        pending -> unavailable
+        terminal: accepted, declined, unavailable
+    }
+}
+
+rule InitializeHostDecision {
+    when: RegisterManagedHost(host)
+    requires: host.managed
+    requires: not exists HostDecision{host}
+    ensures: HostDecision.created(host: host, declined: false, was_accessible: false)
+}
+
+rule PassThroughUnmanagedConnection {
+    when: RequestConnection(request)
+    requires: not request.host.managed
+    ensures: ConnectionAuthorized(request)
+}
+
+rule ProbeManagedConnection {
+    when: RequestConnection(request)
+    requires: request.host.managed
+    let decision = HostDecision{host: request.host}
+    requires: exists decision
+    ensures: ConnectionAttempt.created(
+        request: request, decision: decision, confirmation: null, status: probing
+    )
+}
+
+rule StartHostProbe {
+    when: attempt: ConnectionAttempt.created
+    ensures: ProbeRequested(attempt)
+}
+
+-- Confirmed: a successful probe clears the shared refusal. A declined host is
+-- still probed on later requests so recovery can clear that refusal.
+-- Baseline: an accessible-to-inaccessible transition earns a fresh confirmation.
+rule HandleProbeResult {
+    when: result: ProbeResult.created
+    let attempt = result.attempt
+    requires: attempt.status = probing
+    let was_accessible = attempt.decision.was_accessible
+    let was_declined = attempt.decision.declined
+    let pending_confirmation = attempt.decision.pending_confirmation
+    ensures: attempt.decision.was_accessible = result.reachable
+    ensures:
+        if result.reachable:
+            attempt.decision.declined = false
+            attempt.status = allowed
+        else:
+            if exists pending_confirmation:
+                attempt.confirmation = pending_confirmation
+                attempt.status = awaiting_confirmation
+            else:
+                if was_declined and not was_accessible:
+                    attempt.status = refused
+                else:
+                    if attempt.request.confirmation_available:
+                        let confirmation = HostConfirmation.created(
+                            decision: attempt.decision,
+                            initiator: attempt.request,
+                            status: pending
+                        )
+                        attempt.confirmation = confirmation
+                        attempt.status = awaiting_confirmation
+                        RequestConnectionConfirmation(confirmation)
+                    else:
+                        attempt.status = refused
+}
+
+-- Confirmed: an answer applies to every request joined to the shared prompt.
+-- Approval is scoped to those requests; refusal is also remembered per host.
+rule AcceptConnectionConfirmation {
+    when: ConfirmConnection(confirmation)
+    requires: confirmation.status = pending
+    ensures: confirmation.status = accepted
+    ensures:
+        for attempt in confirmation.attempts:
+            attempt.status = allowed
+}
+
+rule RememberConnectionRefusal {
+    when: DeclineConnection(confirmation)
+    requires: confirmation.status = pending
+    ensures: confirmation.decision.declined = true
+    ensures: confirmation.status = declined
+    ensures:
+        for attempt in confirmation.attempts:
+            attempt.status = refused
+}
+
+-- Confirmed: inability to obtain confirmation fails all joined requests. It is
+-- not an implicit acceptance or a user decline to remember for future sessions.
+rule FailWhenConfirmationUnavailable {
+    when: ConfirmationUnavailable(confirmation)
+    requires: confirmation.status = pending
+    ensures: confirmation.status = unavailable
+    ensures:
+        for attempt in confirmation.attempts:
+            attempt.status = refused
+}
+
+rule AuthorizeManagedConnection {
+    when: attempt: ConnectionAttempt.status transitions_to allowed
+    ensures: ConnectionAuthorized(attempt.request)
+}
+
+rule ReportRefusedConnection {
+    when: attempt: ConnectionAttempt.status transitions_to refused
+    ensures: ConnectionRejected(attempt.request)
+}
+
+rule PassThroughGitOutsideColocatedJj {
+    when: RunGit(request)
+    requires: not request.colocated_jj
+    ensures: ExecuteNativeGit(request)
+}
+
+-- Confirmed: classify explicitly; an unknown operation never falls through.
+rule RejectUnclassifiedGit {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation = unclassified
+    ensures: CommandRejected(request, "Use jj for this operation")
+}
+
+rule ExecuteAllowedGitRead {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation = read
+    ensures: ExecuteSynchronizedGitRead(request)
+}
+
+rule TreatGitAddAsTracked {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation = add
+    ensures: CommandSucceededWithoutExecution(request)
+}
+
+rule TranslateGitMutation {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation in {commit, amend, workspace_add, workspace_list, workspace_prune}
+    ensures: ExecuteJjTranslation(request)
+}
+
+-- Confirmed: force bypasses data protection only, never target protection.
+rule RejectProtectedWorkspaceRemoval {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation = workspace_remove
+    requires: request.protected_target or (request.has_protected_data and not request.force)
+    ensures: CommandRejected(request, "Workspace removal refused")
+}
+
+rule RemoveEligibleWorkspace {
+    when: RunGit(request)
+    requires: request.colocated_jj
+    requires: request.operation = workspace_remove
+    requires: not request.protected_target
+    requires: not request.has_protected_data or request.force
+    ensures: RemoveRegisteredWorkspace(request)
+}
+
+-- Baseline: ordinary uv commands, explicit bypass, and an already guarded tree
+-- delegate directly without nesting another monitor.
+rule DelegateWithoutAdditionalMemoryGuard {
+    when: RunMemoryGuardedCommand(request)
+    requires: not request.is_uv_run or request.bypass_requested or request.enclosing_guard_active
+    ensures: ExecuteWithoutAdditionalGuard(request)
+}
+
+rule ApplyMemoryGuard {
+    when: RunMemoryGuardedCommand(request)
+    requires: request.is_uv_run
+    requires: not request.bypass_requested
+    requires: not request.enclosing_guard_active
+    requires: request.guard_available
+    ensures: ExecuteUnderMemoryGuard(request)
+}
+
+-- Confirmed: a missing executable is a loud fail-open condition.
+rule WarnAndRunWhenMemoryGuardMissing {
+    when: RunMemoryGuardedCommand(request)
+    requires: request.is_uv_run
+    requires: not request.bypass_requested
+    requires: not request.enclosing_guard_active
+    requires: not request.guard_available
+    ensures: UnguardedWarning(request)
+    ensures: ExecuteWithoutAdditionalGuard(request)
+}
+
+invariant SharedDecisionPerHost {
+    for a in HostDecisions:
+        for b in HostDecisions:
+            a.host = b.host implies a = b
+}
+
+invariant DecisionMatchesRequestedHost {
+    for attempt in ConnectionAttempts:
+        attempt.decision.host = attempt.request.host
+}
+
+invariant OnePendingConfirmationPerHost {
+    for a in HostConfirmations:
+        for b in HostConfirmations:
+            a.decision = b.decision and a.status = pending and b.status = pending
+                implies a = b
+}
+
+invariant ConfirmationMatchesAttemptHost {
+    for attempt in ConnectionAttempts:
+        attempt.confirmation != null implies attempt.confirmation.decision = attempt.decision
+}
+
+invariant SharedConfirmationAnswer {
+    for confirmation in HostConfirmations:
+        for attempt in confirmation.attempts:
+            confirmation.status = pending implies attempt.status = awaiting_confirmation
+            confirmation.status = accepted implies attempt.status = allowed
+            confirmation.status in {declined, unavailable} implies attempt.status = refused
+}
+
+surface CommandGuards {
+    facing caller: Caller
+
+    @guarantee ManagedHostAdmission
+        -- ssh, scp, and rsync identify their actual target hosts using their own
+        -- argument conventions. Unmanaged hosts incur no probe or confirmation.
+        -- Every managed target must be authorized before the requested operation
+        -- is delegated. A refusal exits unsuccessfully without executing it.
+        -- Probe failure without a usable confirmation surface fails immediately.
+        -- A remembered decline suppresses repeated prompts across agent sessions.
+
+    @guarantee SharedHostConfirmation
+        -- Concurrent requests needing confirmation for the same host join one
+        -- outstanding prompt. Creating or joining it is atomic per host, including
+        -- requests from different agent sessions. Each joined request receives the
+        -- same approval, refusal, or confirmation-unavailable outcome.
+        -- An existing prompt can serve a request unable to present its own dialog.
+        -- After the answer, later requests follow the normal probe and refusal rules;
+        -- approval of one group is not standing permission for future requests.
+
+    @guarantee GitReadSynchronization
+        -- ExecuteSynchronizedGitRead snapshots and synchronizes jj state before
+        -- delegating the allowlisted Git read. A synchronization failure prevents
+        -- the read from proceeding against stale state. Baseline: no synthetic
+        -- bookmark is created; detached HEAD is valid co-located jj state.
+
+    @guarantee GitTranslations
+        -- Baseline: commit maps to jj commit; amend maps to jj describe.
+        -- worktree add/list/remove/prune map to workspace add/list/remove/update-stale.
+        -- Git-only commit flags are dropped. Read-only branch forms are explicitly
+        -- classified; mutating branch forms, checkout, reset, and clean are refused.
+        -- Removal applies to the exact registered workspace, never a similar path.
+
+    @guarantee MissingMemoryGuard
+        -- The unguarded warning is visible on stderr before the command starts,
+        -- including when stderr is captured. A missing guard must not masquerade
+        -- as a failure of the user's command. The command's own outcome is preserved.
+
+    @guarantee MemoryMonitorBoundary
+        -- Baseline: with-limits is external. Its default ceiling is 70 percent of
+        -- memory available at launch; an explicit fixed limit replaces that value.
+        -- It monitors the owned process tree and terminates only that owned tree.
+        -- Working process-tree RSS inspection takes precedence over the available-
+        -- memory fallback; unrelated host growth must not trip a below-limit tree.
+        -- If no safe monitor is available after guard startup, execution fails.
+        -- Exit 137 denotes a ceiling hit; exit 70 denotes an unusable safety monitor.
+        -- These failures differ from the executable being absent before dispatch.
+
+    @guarantee GuardEntryPoints
+        -- Baseline: the uv shadow and the external pre-tool hook share explicit
+        -- bypass and active-guard semantics. The hook also guards just and uv run
+        -- forms that bypass PATH. An enclosing guard prevents double wrapping.
+        -- MPS watermark settings supplied by the caller take precedence over defaults.
+
+    @guarantee Delegation
+        -- Wrappers resolve the real command without executing themselves again.
+        -- Successful delegation preserves arguments except documented translations,
+        -- and preserves child exit and signal outcomes. A rejected operation does
+        -- not run. Memory monitoring affects only the process tree it owns.
+}
+
+surface ConnectionCommands {
+    facing user: Caller
+    context request: ConnectionRequest where caller = user
+
+    exposes:
+        request.host.name
+        request.confirmation_available
+
+    provides:
+        RequestConnection(request)
+}
+
+surface HostRegistration {
+    facing environment: GuardEnvironment
+    context host: Host
+
+    provides:
+        RegisterManagedHost(host)
+            when host.managed
+}
+
+surface ConnectionConfirmation {
+    facing user: Caller
+    context confirmation: HostConfirmation where initiator.caller = user
+
+    exposes:
+        confirmation.decision.host.name
+        confirmation.status
+
+    provides:
+        ConfirmConnection(confirmation)
+            when confirmation.status = pending
+        DeclineConnection(confirmation)
+            when confirmation.status = pending
+}
+
+surface ConfirmationAvailability {
+    facing environment: GuardEnvironment
+    context confirmation: HostConfirmation
+
+    provides:
+        ConfirmationUnavailable(confirmation)
+            when confirmation.status = pending
+}
+
+surface GitCommands {
+    facing user: Caller
+    context request: GitRequest
+
+    provides:
+        RunGit(request)
+}
+
+surface MemoryGuardCommands {
+    facing user: Caller
+    context request: MemoryGuardRequest
+
+    provides:
+        RunMemoryGuardedCommand(request)
+}
+

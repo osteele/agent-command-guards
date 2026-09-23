@@ -42,11 +42,8 @@ HARNESS_RESUME_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "kimi": ("--session",),
     "opencode": ("--session",),
     "omp": ("--resume",),
+    "agy": ("--conversation",),
 }
-RESUME_ID_PATTERNS = (
-    ("kimi", re.compile(r"session_[0-9a-fA-F-]{36}")),
-    ("opencode", re.compile(r"ses_[A-Za-z0-9]{10,}")),
-)
 # The shapes an agent resolves itself. Anything else named to --resume is a
 # session *name* or transcript text, resolved to one of these before exec.
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -59,10 +56,6 @@ NATIVE_ID_PATTERN = re.compile(rf"(?:session_)?{_UUID}|ses_[A-Za-z0-9]{{10,}}")
 # records are all "no match" rather than an error.
 SESSION_NAMES_DIR = Path.home() / ".claude" / "agent-mail" / "session-names"
 
-# Candidates carried into the per-session AgentsView lookups that a collision
-# needs. A name collides a handful of times at most; this bounds the cost of a
-# pathological one.
-NAME_CANDIDATE_LIMIT = 8
 # Rendered in this order, so an invocation does not depend on file key order.
 ROUTE_FIELDS = ("model",)
 
@@ -185,7 +178,8 @@ def known_harnesses(commands: dict[str, Command]) -> set[str]:
 
 
 def _canonical_harness(
-    commands: dict[str, Command], model: str, harness: str, location: str
+    commands: dict[str, Command], model: str, harness: str, location: str,
+    *, require_route: bool = True,
 ) -> str:
     command = commands[model]
     if harness in {"own", "self", "."}:
@@ -194,7 +188,7 @@ def _canonical_harness(
         aliases = {"own", "self", "."}
         expected = ", ".join(sorted(known_harnesses(commands) | aliases))
         raise ConfigError(f"{location}: unknown harness {harness!r}; expected {expected}")
-    if harness not in command.routes:
+    if require_route and harness not in command.routes:
         expected = ", ".join(sorted(command.routes))
         raise ConfigError(
             f"{location}: {model} does not support harness {harness!r}; "
@@ -268,17 +262,17 @@ def parse_harness_option(
     if first == "--harness":
         if len(arguments) == 1:
             raise ConfigError("--harness requires a harness name")
-        return _canonical_harness(commands, model, arguments[1], "--harness"), arguments[2:]
+        return _canonical_harness(commands, model, arguments[1], "--harness", require_route=False), arguments[2:]
     if first.startswith("--harness="):
         harness = first.partition("=")[2]
         if not harness:
             raise ConfigError("--harness requires a harness name")
-        return _canonical_harness(commands, model, harness, "--harness"), arguments[1:]
+        return _canonical_harness(commands, model, harness, "--harness", require_route=False), arguments[1:]
     if first == "-h" and len(arguments) > 1:
         candidate = arguments[1]
         aliases = {"own", "self", "."}
         if candidate in known_harnesses(commands) or candidate in aliases:
-            return _canonical_harness(commands, model, candidate, "-h"), arguments[2:]
+            return _canonical_harness(commands, model, candidate, "-h", require_route=False), arguments[2:]
     return None, arguments
 
 
@@ -305,6 +299,8 @@ def parse_resume_option(
 
 def normalize_resume_id(session_id: str) -> tuple[str, str | None]:
     """Convert an AgentsView canonical id to the harness's native id."""
+    if session_id.startswith("antigravity-cli:"):
+        return session_id.removeprefix("antigravity-cli:"), "agy"
     for harness in HARNESS_RESUME_ARGUMENTS:
         prefix = f"{harness}:"
         if not session_id.startswith(prefix):
@@ -312,16 +308,6 @@ def normalize_resume_id(session_id: str) -> tuple[str, str | None]:
         native_id = session_id.rsplit(":", 1)[-1] if harness == "kimi" else session_id[len(prefix) :]
         return native_id, harness
     return session_id, None
-
-
-def _agentsview_json(arguments: list[str], timeout: float = 10.0) -> object | None:
-    """Run one AgentsView query and return its parsed JSON, or None.
-
-    None covers every way the answer can be missing: AgentsView not installed,
-    the query failing, and output that is not JSON. A miss is not an error here
-    — the caller has other ways to resolve the same value.
-    """
-    return _agentsview_query(arguments, timeout)[0]
 
 
 def _agentsview_query(
@@ -349,9 +335,10 @@ def _agentsview_query(
         print(f"agent-model: AgentsView lookup failed: {error}", file=sys.stderr)
         return None, False
     if result.returncode != 0:
-        # A query AgentsView ran and answered negatively. "not found" is an
-        # answer; anything else is the tool failing to answer at all.
-        return None, "not found" in result.stderr.casefold()
+        # Only a session-not-found diagnostic is authoritative, not e.g. a
+        # missing config file or executable reported by the indexing service.
+        missing = re.search(r"\bsession\b[^\n]*\bnot found\b", result.stderr, re.IGNORECASE)
+        return None, arguments[:2] == ["session", "get"] and missing is not None
     try:
         return json.loads(result.stdout), True
     except json.JSONDecodeError as error:
@@ -359,41 +346,30 @@ def _agentsview_query(
         return None, False
 
 
-def session_metadata(session_id: str) -> dict[str, object] | None:
-    """AgentsView's record for one session id, or None when it knows none."""
-    metadata = _agentsview_json(["session", "get", session_id])
-    return metadata if isinstance(metadata, dict) else None
-
-
-def _metadata_harness(metadata: dict[str, object] | None) -> str | None:
-    if metadata is None:
+def metadata_match(
+    metadata: object, session_id: str, recency: str = ""
+) -> SessionMatch | None:
+    """Accept only metadata that explicitly identifies this exact conversation."""
+    if not isinstance(metadata, dict):
         return None
-    agent = metadata.get("agent")
-    if not isinstance(agent, str):
-        print(
-            "agent-model: AgentsView returned session metadata without an agent",
-            file=sys.stderr,
-        )
+    canonical, agent = metadata.get("id"), metadata.get("agent")
+    if agent == "antigravity-cli":
+        agent = "agy"
+    if not isinstance(canonical, str) or not isinstance(agent, str) or agent not in HARNESS_RESUME_ARGUMENTS:
         return None
-    return agent if agent in HARNESS_RESUME_ARGUMENTS else None
-
-
-def infer_resume_harness(session_id: str) -> str | None:
-    """Identify the harness from a native id shape or AgentsView metadata."""
-    for harness, pattern in RESUME_ID_PATTERNS:
-        if pattern.fullmatch(session_id):
-            return harness
-    return _metadata_harness(session_metadata(session_id))
+    native_id, prefix = normalize_resume_id(canonical)
+    if native_id != session_id or (prefix is not None and prefix != agent):
+        return None
+    return SessionMatch(native_id, agent, recency, f"{agent}:{native_id}")
 
 
 class SessionMatch(NamedTuple):
     """One session a --resume argument could name."""
 
     session_id: str
-    harness: str | None
+    harness: str
     recency: str
     label: str
-    indexed: bool = False
 
 
 # Session ids naming the session this process is running inside. Resuming the
@@ -482,7 +458,7 @@ def sessions_named(query: str, directory: Path = SESSION_NAMES_DIR) -> list[Sess
         matches.append(
             SessionMatch(
                 session_id=session_id,
-                harness=None,
+                harness="",
                 recency=assigned if isinstance(assigned, str) else "",
                 label=session_id,
             )
@@ -496,58 +472,36 @@ def sessions_named(query: str, directory: Path = SESSION_NAMES_DIR) -> list[Sess
     return _ranked(matches)
 
 
-def _described(match: SessionMatch, metadata: dict[str, object] | None) -> SessionMatch:
-    """Fill in the harness and a human label from AgentsView metadata."""
-    if metadata is None:
-        return match
-    agent = metadata.get("agent")
-    project = metadata.get("project")
-    started = metadata.get("started_at")
-    parts = [part for part in (agent, project) if isinstance(part, str)]
-    if isinstance(started, str):
-        parts.append(started[:10])
-    return match._replace(
-        harness=_metadata_harness(metadata),
-        label=f"{match.label} ({', '.join(parts)})" if parts else match.label,
-        indexed=True,
+def sessions_containing(query: str) -> Resolution:
+    """Search message text, never tool arguments/results or a harness-only index."""
+    payload, answered = _agentsview_query(
+        ["session", "search", query, "--fts", "--limit", "50"], timeout=10.0
     )
-
-
-def sessions_containing(query: str, agent: str | None = None) -> list[SessionMatch]:
-    """Sessions whose transcript contains `query`, most recent match first."""
-    # --fts is the tokenized index over message text. The default search also
-    # reads tool arguments and results, and takes ~40s against this machine's
-    # archive against ~0.5s for the index -- too slow to sit in front of a
-    # launch. Remembered text is almost always something that was *said*.
-    arguments = ["session", "search", query, "--fts", "--limit", "50"]
-    if agent is not None:
-        arguments.extend(("--agent", agent))
-    payload = _agentsview_json(arguments, timeout=30.0)
     if not isinstance(payload, dict) or not isinstance(payload.get("matches"), list):
-        return []
-    matches: dict[str, SessionMatch] = {}
+        return Resolution([], False)
+    matches = []
+    valid = answered
     for entry in payload["matches"]:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or not isinstance(entry.get("session_id"), str):
+            valid = False
             continue
-        canonical = entry.get("session_id")
-        if not isinstance(canonical, str):
+        native_id, harness = normalize_resume_id(entry["session_id"])
+        agent = entry.get("agent")
+        if agent == "antigravity-cli":
+            agent = "agy"
+        if (
+            harness is None
+            or not NATIVE_ID_PATTERN.fullmatch(native_id)
+            or (agent is not None and agent != harness)
+        ):
+            valid = False
             continue
-        session_id, harness = normalize_resume_id(canonical)
         timestamp = entry.get("timestamp")
-        project = entry.get("project")
-        described = [part for part in (harness, project) if isinstance(part, str)]
-        recency = timestamp if isinstance(timestamp, str) else ""
-        existing = matches.get(session_id)
-        if existing is not None and existing.recency >= recency:
-            continue
-        matches[session_id] = SessionMatch(
-            session_id=session_id,
-            harness=harness,
-            recency=recency,
-            label=f"{canonical} ({', '.join(described)})" if described else canonical,
-            indexed=True,
-        )
-    return _ranked(matches.values())
+        matches.append(SessionMatch(
+            native_id, harness, timestamp if isinstance(timestamp, str) else "",
+            f"{harness}:{native_id}",
+        ))
+    return Resolution(_ranked(matches), valid)
 
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -558,11 +512,8 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # harness that owns it -- both of the answers AgentsView is otherwise asked for,
 # for the cost of a readdir.
 #
-# Asked before AgentsView because a miss there costs ~16s: it concludes absence
-# only after scanning its whole archive, which is where the launch-time timeouts
-# came from. opencode is absent deliberately -- it keeps no transcript store to
-# glob, and its `ses_` ids are native shapes that resolve without ever reaching
-# here.
+# Ask the filesystem first because an indexed miss can be slow. An absent file
+# is not proof of absence; only an exact filename verifies identity locally.
 #
 # The layouts are another tool's, and this repository cannot prove them; each was
 # read off this machine's stores on 2026-09-18. A pattern that goes wrong when
@@ -572,62 +523,24 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 LOCAL_SESSION_STORES: dict[str, tuple[Path, str]] = {
     "claude": (CLAUDE_PROJECTS_DIR, "*/{session_id}.jsonl"),
     "omp": (Path.home() / ".omp" / "agent" / "sessions", "*/*_{session_id}.jsonl"),
-    "codex": (Path.home() / ".codex" / "sessions", "*/*/*/*{session_id}*.jsonl"),
+    "codex": (Path.home() / ".codex" / "sessions", "*/*/*/rollout-*-{session_id}.jsonl"),
 }
 
 
 def local_store_harness(
     session_id: str, stores: dict[str, tuple[Path, str]] | None = None
 ) -> str | None:
-    """The harness whose own session store holds this id, or None."""
-    if not session_id:
+    """The unique harness whose own session store holds this exact native id."""
+    if not NATIVE_ID_PATTERN.fullmatch(session_id):
         return None
+    owners = []
     for harness, (directory, pattern) in (stores or LOCAL_SESSION_STORES).items():
         try:
-            if any(directory.glob(pattern.format(session_id=session_id))):
-                return harness
+            if any(path.is_file() for path in directory.glob(pattern.format(session_id=session_id))):
+                owners.append(harness)
         except OSError:
             continue
-    return None
-
-
-# agent-mail's per-session announcement records: the one durable place the
-# directory a session ran in survives its exit, as
-# {"version": 1, "sessionId", "project", ...} under a filename ending in the
-# session id. The registry record that also carries the harness is pruned when
-# the session exits, so it is never there when a resume asks for it.
-#
-# Written only for sessions that received mail -- about one name in three -- so
-# its absence is ordinary and never an error.
-ANNOUNCED_DIR = Path.home() / ".claude" / "agent-mail" / "announced"
-
-# How far apart a harness session's start and its agent-mail name may be.
-# agent-mail mints the name when the session's channel server starts, seconds
-# after the harness itself; the observed gap on this machine is under a second.
-# Wide enough for a slow start, far short of the spacing between sessions a
-# person actually runs.
-NAME_JOIN_WINDOW_SECONDS = 120.0
-
-
-def announced_cwd(session_id: str, directory: Path = ANNOUNCED_DIR) -> str | None:
-    """The directory agent-mail recorded this session running in, or None."""
-    if not session_id:
-        return None
-    try:
-        entries = sorted(directory.glob(f"*-{session_id}.json"))
-    except OSError:
-        return None
-    for entry in entries:
-        try:
-            record = json.loads(entry.read_bytes())
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(record, dict) or record.get("version") != 1:
-            continue
-        project = record.get("project")
-        if isinstance(project, str) and project:
-            return project
-    return None
+    return owners[0] if len(owners) == 1 else None
 
 
 def _timestamp(value: object) -> float | None:
@@ -639,194 +552,193 @@ def _timestamp(value: object) -> float | None:
         return None
 
 
-def native_session_for(
-    session_id: str, assigned_at: str, agent: str | None = None
-) -> SessionMatch | None:
-    """The harness session an agent-mail name belongs to, joined on when and where.
-
-    A harness that exports no session id of its own -- omp, kimi, opencode, agy
-    -- is named against the launcher's `AGENT_SESSION_ID`, which no harness
-    resolves. Resuming that id hands the harness an address it rejects. But
-    AgentsView indexes the same session under its native id and records when and
-    where it ran, and agent-mail records when it named it and, usually, where.
-    Those meet.
-
-    `session list` with filters answers in ~0.16s, against the ~16s `session
-    get` spends concluding that a launcher-minted id is unknown to it.
-    """
-    named_at = _timestamp(assigned_at)
-    if named_at is None:
-        return None
-    # A session started just before midnight and named just after is still
-    # *active* on the naming date, which is what --date selects, so one query
-    # covers the boundary.
-    arguments = [
-        "session",
-        "list",
-        "--date",
-        assigned_at[:10],
-        "--include-one-shot",
-        "--limit",
-        "200",
-    ]
-    if agent is not None:
-        arguments.extend(("--agent", agent))
-    payload = _agentsview_json(arguments)
-    if not isinstance(payload, dict) or not isinstance(payload.get("sessions"), list):
-        return None
-
-    recorded_cwd = announced_cwd(session_id)
-    candidates: list[SessionMatch] = []
-    for entry in payload["sessions"]:
-        if not isinstance(entry, dict):
-            continue
-        canonical = entry.get("id")
-        started = _timestamp(entry.get("started_at"))
-        if not isinstance(canonical, str) or started is None:
-            continue
-        if abs(started - named_at) > NAME_JOIN_WINDOW_SECONDS:
-            continue
-        entry_cwd = entry.get("cwd")
-        if recorded_cwd is not None and entry_cwd != recorded_cwd:
-            continue
-        native_id, harness = normalize_resume_id(canonical)
-        candidates.append(
-            SessionMatch(
-                session_id=native_id,
-                harness=harness,
-                recency=assigned_at,
-                label=f"{canonical} ({entry_cwd})" if isinstance(entry_cwd, str) else canonical,
-                indexed=True,
-            )
-        )
-
-    if len(candidates) > 1 and recorded_cwd is None:
-        # No recorded directory to match against. The one the resume was typed
-        # in is a weaker signal -- the session being resumed need not be the one
-        # you are standing in -- so it narrows and never decides alone.
-        here = [match for match in candidates if f"({os.getcwd()})" in match.label]
-        if len(here) == 1:
-            candidates = here
-    if len(candidates) > 1:
-        # An ambiguous cross-system join is never reported as authoritative.
-        others = ", ".join(match.label for match in candidates[:4])
-        print(
-            f"agent-model: {len(candidates)} sessions started within "
-            f"{int(NAME_JOIN_WINDOW_SECONDS)}s of this name; not guessing which "
-            f"it names ({others}). Pass a session id to select one.",
-            file=sys.stderr,
-        )
-        return None
-    return candidates[0] if candidates else None
-
-
 def _ranked(matches: Iterable[SessionMatch]) -> list[SessionMatch]:
-    """Newest first, and a session some index knows ahead of one none does.
-
-    A name the archive cannot place is usually a session whose transcript has
-    been pruned; resuming a described session is likelier to reach something.
-    """
+    """Deduplicate exact conversations and rank by timestamp, newest first."""
     current = current_session_ids()
-    candidates = [match for match in matches if match.session_id not in current]
+    unique: dict[tuple[str, str], SessionMatch] = {}
+    for match in matches:
+        if match.session_id in current:
+            continue
+        key = (match.harness, match.session_id)
+        previous = unique.get(key)
+        if previous is None or (_timestamp(match.recency) or 0) > (_timestamp(previous.recency) or 0):
+            unique[key] = match
     return sorted(
-        candidates, key=lambda match: (match.indexed, match.recency), reverse=True
+        unique.values(),
+        key=lambda match: (_timestamp(match.recency) or 0, match.harness, match.session_id),
+        reverse=True,
     )
 
 
-def _preferred(matches: list[SessionMatch], agent: str | None) -> list[SessionMatch]:
-    """Matches for the requested agent, or every match when it names none.
-
-    The agent is a preference rather than a filter: a caller that finds a
-    session belonging to another harness can say so, which is more use than
-    reporting no match at all.
-    """
-    if agent is None:
-        return matches
-    preferred = [match for match in matches if match.harness == agent]
-    return preferred or matches
+class Resolution(NamedTuple):
+    matches: list[SessionMatch]
+    conclusive: bool
 
 
-def _selected(matches: list[SessionMatch], query: str) -> SessionMatch:
-    """The newest match, reporting the others it was chosen over."""
-    chosen = matches[0]
-    if len(matches) > 1:
-        others = ", ".join(match.label for match in matches[1:4])
+def exact_session(query: str) -> Resolution:
+    """Positive local evidence first, then one exact supported CLI lookup."""
+    native_id, _ = normalize_resume_id(query)
+    if not NATIVE_ID_PATTERN.fullmatch(native_id):
+        return Resolution([], False)
+    harness = local_store_harness(native_id)
+    if harness is not None:
+        return Resolution([SessionMatch(native_id, harness, "", f"{harness}:{native_id}")], True)
+    record, answered = _agentsview_query(["session", "get", native_id])
+    match = metadata_match(record, native_id)
+    if match is not None:
+        return Resolution([match], True)
+    # Null/not-found is an answer; a malformed or mismatched record is not.
+    return Resolution([], answered and record is None)
+
+
+def resolve_resume_target(query: str) -> Resolution:
+    """Exact id, durable name, then message text, without heuristic identity joins."""
+    if not query.strip():
+        raise ConfigError("resume query must not be empty")
+    native_id, _ = normalize_resume_id(query)
+    if NATIVE_ID_PATTERN.fullmatch(native_id):
+        if native_id in current_session_ids():
+            return Resolution([], True)
+        resolution = exact_session(query)
+        return Resolution(_ranked(resolution.matches), resolution.conclusive)
+    named = sessions_named(query)
+    if named:
+        matches = []
+        conclusive = True
+        for candidate in named:
+            resolution = exact_session(candidate.session_id)
+            conclusive = conclusive and resolution.conclusive
+            matches.extend(
+                match._replace(recency=candidate.recency) for match in resolution.matches
+            )
+        # A known name never falls through to an unrelated transcript mentioning it.
+        return Resolution(_ranked(matches), conclusive)
+    return sessions_containing(query)
+
+
+def interactive_invocation(harness: str, arguments: list[str]) -> bool:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    return not headless_invocation(harness, arguments)
+
+
+def argument_takes_value(harness: str, argument: str) -> bool:
+    """Native option values cannot be interpreted as resume or execution modes."""
+    if argument in {
+        "--model", "-m", "--provider", "--config", "-c", "--profile", "--cd", "-C",
+        "--resume", "-r", "--session", "-s", "-S", "--conversation", "--mode",
+    }:
+        return True
+    return harness == "codex" and argument in {
+        "-p", "-i", "--image", "--enable", "--disable", "--remote",
+        "--remote-auth-token-env", "--local-provider", "--sandbox", "--add-dir",
+        "-a", "--ask-for-approval", "--output-schema", "--output-last-message", "-o",
+    }
+
+
+def headless_invocation(harness: str, arguments: list[str]) -> bool:
+    skip_value = False
+    mode_value = False
+    for argument in arguments:
+        if skip_value:
+            if mode_value and argument in {"json", "rpc"}:
+                return True
+            skip_value = mode_value = False
+            continue
+        if argument == "--":
+            break
+        if argument in {"--help", "-h", "--version", "-V"}:
+            return True
+        if harness == "omp" and argument in {"--mode=json", "--mode=rpc"}:
+            return True
+        if argument_takes_value(harness, argument):
+            skip_value = True
+            mode_value = harness == "omp" and argument == "--mode"
+            continue
+        if harness == "codex" and not argument.startswith("-"):
+            return argument in {
+                "exec", "e", "review", "login", "logout", "mcp", "plugin",
+                "app-server", "remote-control", "app", "completion", "update",
+                "doctor", "sandbox", "debug", "apply", "a", "queue", "archive",
+                "delete", "migrate-rollouts", "unarchive", "cloud", "exec-server",
+                "features", "help",
+            }
+        if harness == "opencode" and not argument.startswith("-"):
+            return argument == "run"
+        if harness in {"omp", "kimi", "agy", "claude"} and (
+            argument in {"-p", "--print"} or argument.startswith("--print=")
+        ):
+            return True
+    return False
+
+
+def prompt_choice(title: str, choices: list[str], cancelled: str) -> int:
+    print(f"agent-model: {title}", file=sys.stderr)
+    for index, choice in enumerate(choices, 1):
+        print(f"  {index}) {choice}", file=sys.stderr)
+    while True:
+        print("Choose a number, or q to cancel: ", end="", file=sys.stderr, flush=True)
+        try:
+            answer = sys.stdin.readline().strip()
+        except KeyboardInterrupt:
+            raise ConfigError(cancelled) from None
+        if not answer or answer.casefold() in {"q", "cancel"}:
+            raise ConfigError(cancelled)
+        if answer.isdecimal() and 1 <= int(answer) <= len(choices):
+            return int(answer) - 1
+        print("Invalid selection.", file=sys.stderr)
+
+
+def select_resume(
+    query: str, requested: str | None, invocation: str, interactive: bool
+) -> SessionMatch:
+    resolution = resolve_resume_target(query)
+    matches = resolution.matches
+    if not matches:
+        native_id, _ = normalize_resume_id(query)
+        if not resolution.conclusive and NATIVE_ID_PATTERN.fullmatch(native_id):
+            print("agent-model: Lookup unavailable; attempting exact native ID without verified ownership", file=sys.stderr)
+            return SessionMatch(native_id, invocation, "", native_id)
+        reason = "No matching conversation" if resolution.conclusive else "Lookup unavailable"
+        raise ConfigError(f"{reason}: {query!r}")
+    return select_matches(matches, query, requested, interactive)
+
+
+def select_matches(
+    matches: list[SessionMatch], query: str, requested: str | None, interactive: bool
+) -> SessionMatch:
+    preferred = [match for match in matches if match.harness == requested]
+    if interactive and preferred and matches[0].harness != requested:
+        selected = prompt_choice(
+            f"A newer conversation belongs to another harness (requested {requested})",
+            [match.label for match in matches], "Selection cancelled",
+        )
+        return matches[selected]
+    chosen = preferred[0] if preferred else matches[0]
+    alternatives = [match.label for match in matches if match != chosen]
+    if alternatives:
         print(
             f"agent-model: {len(matches)} sessions match {query!r}; resuming "
-            f"{chosen.label}. Others: {others}. Pass a session id to select one.",
-            file=sys.stderr,
+            f"{chosen.label}. Others: {', '.join(alternatives)}. "
+            "Pass a session id to select one.", file=sys.stderr,
         )
     return chosen
 
 
-def _placed(match: SessionMatch, agent: str | None) -> SessionMatch | None:
-    """A named session as something a harness can open, or None to drop it.
-
-    Three sources, cheapest and most certain first, and each answers both of the
-    questions a match raises -- whether it opens, and which harness opens it:
-
-    1. The harness's own store. Local, instant, and conclusive when it hits.
-    2. The join to the session AgentsView indexed, for a name recorded against
-       the launcher's id because its harness exports none of its own.
-    3. AgentsView's record for the id as stored, asked *once* and shared between
-       placing the match and describing it.
-
-    A name can also resolve to an id that no longer opens anything: Claude Code
-    mints a fresh id for each *run* of a resumed conversation and appends to the
-    original transcript, so the run's id names no file -- agent-mail still named
-    that run, so the store holds a name pointing at an id `--resume` answers "No
-    conversation found with session ID" for. Such a match is dropped, but only
-    on evidence. An AgentsView that did not answer proves nothing, and reading
-    its silence as absence would turn an outage into a confident wrong answer.
-    """
-    harness = local_store_harness(match.session_id)
-    if harness is not None:
-        return match._replace(harness=harness, indexed=True)
-    joined = native_session_for(match.session_id, match.recency, agent)
-    if joined is not None:
-        return joined
-    record, answered = _agentsview_query(["session", "get", match.session_id])
-    if isinstance(record, dict):
-        return _described(match, record)
-    if answered:
-        return None
-    print(
-        f"agent-model: no harness store, no indexed session, and no answer from "
-        f"AgentsView for {match.session_id}; resuming it unconfirmed",
-        file=sys.stderr,
-    )
-    return match
-
-
-def resolve_resume_target(query: str, agent: str | None = None) -> SessionMatch | None:
-    """Resolve a --resume argument that is not already a native session id.
-
-    Tried in order of how specific the answer is: an id AgentsView knows, an
-    agent-mail session name, then text from a transcript. Returns None when
-    nothing resolves, leaving the argument to reach the agent as typed.
-    """
-    if not query.strip():
-        return None
-    if not any(character.isspace() for character in query):
-        metadata = session_metadata(query)
-        harness = _metadata_harness(metadata)
-        if metadata is not None:
-            return _described(SessionMatch(query, harness, "", query), metadata)
-
-    named = sessions_named(query)
-    if named:
-        described = _ranked(
-            resolved
-            for match in named[:NAME_CANDIDATE_LIMIT]
-            if (resolved := _placed(match, agent)) is not None
-        )
-        if described:
-            return _selected(_preferred(described, agent), query)
-
-    contained = sessions_containing(query, agent)
-    if contained:
-        return _selected(_preferred(contained, agent), query)
-    return None
+def resume_model_route(
+    commands: dict[str, Command], model: str, harness: str,
+    invocation_harness: str, interactive: bool,
+) -> list[str]:
+    command = commands.get(model)
+    if command is not None and harness in command.routes:
+        return list(command.routes[harness])
+    reason = f"Requested model {model!r} has no route on the resume harness {harness!r}"
+    if harness != invocation_harness and interactive:
+        compatible = [name for name, configured in commands.items() if harness in configured.routes]
+        if compatible:
+            selected = prompt_choice(reason, compatible, "Model selection cancelled")
+            return list(commands[compatible[selected]].routes[harness])
+    raise ConfigError(reason)
 
 
 def resume_arguments(harness: str, session_id: str | None) -> list[str]:
@@ -843,78 +755,161 @@ def resolve(
         raise ConfigError(f"unknown model {model!r}; expected {', '.join(commands)}")
     explicit, forwarded = parse_harness_option(commands, model, arguments)
     resume_requested, resume_id, forwarded = parse_resume_option(forwarded)
-    prefixed_harness = None
+    invocation_harness = explicit or defaults_with_sources(commands)[model][0]
+    harness = invocation_harness
+    mode_arguments = (resume_arguments(harness, resume_id) if resume_requested else []) + forwarded
+    interactive = interactive_invocation(harness, mode_arguments)
     if resume_id is not None:
-        resume_id, prefixed_harness = normalize_resume_id(resume_id)
-        # A name or a line of transcript text resolves to a native id here, so
-        # everything downstream sees an id the harness can open. An explicit
-        # harness still narrows the search, and still wins the routing below.
-        if prefixed_harness is None and not NATIVE_ID_PATTERN.fullmatch(resume_id):
-            resolved = resolve_resume_target(resume_id, explicit)
-            if resolved is not None:
-                resume_id = resolved.session_id
-                prefixed_harness = resolved.harness
-    inferred = (
-        prefixed_harness or infer_resume_harness(resume_id)
-        if resume_id is not None and explicit is None
-        else None
-    )
-    if explicit is not None:
-        harness = explicit
-    elif inferred is not None:
-        harness = inferred
-    else:
-        harness, _ = defaults_with_sources(commands)[model]
-
-    if harness in commands[model].routes:
-        invocation = list(commands[model].routes[harness])
-    elif resume_requested and inferred == harness:
-        # A resumed session already owns its model. This keeps an inferred
-        # foreign harness usable even when the model command has no route to it.
-        invocation = [harness]
-    else:
-        raise AssertionError(f"unresolved route for {model} through {harness}")
+        selected = select_resume(resume_id, explicit, invocation_harness, interactive)
+        resume_id, harness = selected.session_id, selected.harness
+    invocation = resume_model_route(commands, model, harness, invocation_harness, interactive)
     if resume_requested:
         invocation.extend(resume_arguments(harness, resume_id))
     invocation.extend(forwarded)
     return invocation, harness
 
 
-def command_resolve_session(arguments: list[str]) -> int:
-    """Print the session id one --resume argument names, and its harness.
+def session_cli_arguments(arguments: list[str]) -> tuple[str, str | None]:
+    agent = None
+    rest = []
+    iterator = iter(arguments)
+    for argument in iterator:
+        if argument == "--agent" or argument.startswith("--agent="):
+            if agent is not None:
+                raise ConfigError("--agent may only be given once")
+            agent = next(iterator, "") if argument == "--agent" else argument.partition("=")[2]
+            if agent not in HARNESS_RESUME_ARGUMENTS:
+                raise ConfigError("--agent requires a supported harness name")
+        else:
+            rest.append(argument)
+    if len(rest) != 1 or not rest[0].strip() or rest[0].startswith("-"):
+        raise ConfigError("expected one session query")
+    return rest[0], agent
 
-    Three lines: the native session id, the harness that owns it, and how that
-    harness spells a resume -- the last two empty when nothing could say. Exit 3
-    means nothing matched, which is a caller's cue to pass the argument through
-    rather than a failure.
-    """
-    agent: str | None = None
-    rest = list(arguments)
-    for index, argument in enumerate(rest):
-        if argument == "--agent":
-            if index + 1 >= len(rest):
-                raise ConfigError("--agent requires an agent name")
-            agent = rest[index + 1]
-            rest = rest[:index] + rest[index + 2 :]
-            break
-        if argument.startswith("--agent="):
-            agent = argument.partition("=")[2]
-            if not agent:
-                raise ConfigError("--agent requires an agent name")
-            rest = rest[:index] + rest[index + 1 :]
-            break
-    if len(rest) != 1:
-        raise ConfigError("resolve-session takes one query")
-    resolved = resolve_resume_target(rest[0], agent)
-    if resolved is None:
+
+def command_verify_session(arguments: list[str]) -> int:
+    query, agent = session_cli_arguments(arguments)
+    native_id, prefix = normalize_resume_id(query)
+    if agent is None or not NATIVE_ID_PATTERN.fullmatch(native_id):
+        raise ConfigError("verify-session requires an exact native ID and --agent HARNESS")
+    if prefix is not None and prefix != agent:
         return 3
-    print(resolved.session_id)
-    print(resolved.harness or "")
-    if resolved.harness is not None:
-        print(shlex.join([resolved.harness, *HARNESS_RESUME_ARGUMENTS[resolved.harness]]))
-    else:
-        print("")
+    resolution = exact_session(query)
+    if not resolution.matches or resolution.matches[0].harness != agent:
+        return 3
+    print(native_id)
+    print(agent)
     return 0
+
+
+def command_resolve_session(arguments: list[str]) -> int:
+    """Three lines on success; 3 definitive miss; 4 unavailable; 2 invalid/cancelled."""
+    query, agent = session_cli_arguments(arguments)
+    resolution = resolve_resume_target(query)
+    if not resolution.matches:
+        reason = "No matching conversation" if resolution.conclusive else "Lookup unavailable"
+        print(f"agent-model: {reason}: {query!r}", file=sys.stderr)
+        return 3 if resolution.conclusive else 4
+    # Selection policy is shared with both launching entrypoints.
+    chosen = select_matches(resolution.matches, query, agent, interactive_invocation(agent or "", []))
+    print(chosen.session_id)
+    print(chosen.harness)
+    print(shlex.join([chosen.harness, *HARNESS_RESUME_ARGUMENTS[chosen.harness]]))
+    return 0
+
+NATIVE_RESUME_FLAGS = {
+    "claude": {"--resume", "-r"},
+    "codex": {"resume"},
+    "omp": {"--resume", "-r"},
+    "kimi": {"--resume", "-r", "--session", "-S"},
+    "opencode": {"--session", "-s"},
+    "agy": {"--conversation"},
+}
+
+
+def command_prepare_resume(commands: dict[str, Command], arguments: list[str]) -> int:
+    """Internal Bash boundary: emit NUL-delimited owning harness and argv."""
+    if not arguments or arguments[0] not in NATIVE_RESUME_FLAGS:
+        raise ConfigError("prepare-resume requires a supported harness")
+    harness, forwarded = arguments[0], arguments[1:]
+    interactive = False
+    if forwarded[:1] == ["--interactive"]:
+        interactive = sys.stdin.isatty()
+        forwarded = forwarded[1:]
+    if forwarded[:1] != ["--"]:
+        raise ConfigError("prepare-resume requires -- before harness arguments")
+    forwarded = forwarded[1:]
+    interactive = interactive and not headless_invocation(harness, forwarded)
+    invocation = [harness, *forwarded]
+    skip_value = False
+    for index, argument in enumerate(forwarded):
+        if skip_value:
+            skip_value = False
+            continue
+        if argument == "--":
+            break
+        flag, attached, value = argument.partition("=")
+        if flag not in NATIVE_RESUME_FLAGS[harness]:
+            if not attached and argument_takes_value(harness, flag):
+                skip_value = True
+            elif harness == "codex" and not argument.startswith("-") and argument not in {"exec", "e"}:
+                break
+            continue
+        end = index + 1
+        if not attached:
+            value = forwarded[end] if end < len(forwarded) else ""
+            end += 1
+        if not value or value.startswith("-"):
+            continue
+        chosen = select_resume(value, harness, harness, interactive)
+        if chosen.harness == harness:
+            replacement = [f"{flag}={chosen.session_id}"] if attached else [flag, chosen.session_id]
+            invocation = [harness, *forwarded[:index], *replacement, *forwarded[end:]]
+        else:
+            remaining = forwarded[:index] + forwarded[end:]
+            model_value = None
+            model_free = []
+            model_index = 0
+            while model_index < len(remaining):
+                model_arg = remaining[model_index]
+                if model_arg == "--":
+                    model_free.extend(remaining[model_index:])
+                    break
+                model_flag, model_attached, model_value_candidate = model_arg.partition("=")
+                if model_arg.startswith("-m") and not model_attached and len(model_arg) > 2:
+                    model_flag, model_attached, model_value_candidate = "-m", "=", model_arg[2:]
+                if model_flag not in {"--model", "-m"}:
+                    model_free.append(model_arg)
+                    model_index += 1
+                    continue
+                model_index += 1
+                if not model_attached:
+                    if model_index >= len(remaining):
+                        raise ConfigError(f"{model_flag} requires a model")
+                    model_value_candidate = remaining[model_index]
+                    model_index += 1
+                # The provider's last model flag wins; remove every source
+                # spelling so none can override the translated route.
+                model_value = model_value_candidate
+            remaining = model_free
+            route = [chosen.harness]
+            if model_value is not None:
+                # Reverse only an exact configured route; never guess by model family.
+                model = model_value
+                for name, command in commands.items():
+                    source = command.routes.get(harness, ())
+                    selector = source[-1].removeprefix("--model=") if len(source) > 1 else None
+                    if model_value == name or model_value == selector:
+                        model = name
+                        break
+                route = resume_model_route(commands, model, chosen.harness, harness, interactive)
+            invocation = [
+                *route, *resume_arguments(chosen.harness, chosen.session_id), *remaining,
+            ]
+        break
+    sys.stdout.buffer.write(b"".join(os.fsencode(value) + b"\0" for value in invocation))
+    return 0
+
 
 
 def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None:
@@ -923,6 +918,7 @@ def print_usage(commands: dict[str, Command], file: object = sys.stdout) -> None
   agent-model launch MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION]] [ARG ...]
   agent-model resolve MODEL [--harness HARNESS | -h HARNESS] [--resume [SESSION]] [ARG ...]
   agent-model resolve-session QUERY [--agent AGENT]
+  agent-model verify-session ID --agent HARNESS
   agent-model default list
   agent-model default get MODEL
   agent-model default set MODEL HARNESS
@@ -1045,6 +1041,10 @@ def main(arguments: list[str]) -> int:
         return command_default(commands, rest)
     if command == "resolve-session":
         return command_resolve_session(rest)
+    if command == "verify-session":
+        return command_verify_session(rest)
+    if command == "prepare-resume":
+        return command_prepare_resume(commands, rest)
     if command == "config":
         return command_config(commands, rest)
     if command == "doctor":
