@@ -1,0 +1,55 @@
+#!/bin/bash
+# Marks the jj process so the git shadow can recognize the Git that jj itself
+# spawns. `jj git fetch` and `jj git push` shell out to `git`, and in a
+# co-located repository the git shadow would otherwise refuse them.
+#
+# The marker is this script's PID, which jj inherits through `exec`; the git
+# shadow honors it only when it is the Git's parent. It is a compatibility
+# signal, not a security boundary.
+set -euo pipefail
+
+# Runs before every jj command, so the lookup forks nothing: `-ef` compares
+# device and inode, which also sees through symlinks to this file.
+REAL_JJ=""
+IFS=: read -r -a path_entries <<< "${PATH:-}"
+for dir in ${path_entries[@]+"${path_entries[@]}"}; do
+    candidate="${dir:-.}/jj"
+    if [[ -f "$candidate" && -x "$candidate" && ! "$candidate" -ef "$0" ]]; then
+        REAL_JJ="$candidate"
+        break
+    fi
+done
+if [[ -z "$REAL_JJ" ]]; then
+    echo "jj shadow: could not find the real jj binary on PATH" >&2
+    exit 127
+fi
+
+# `jj util exec -- git ...` runs an arbitrary program as jj's direct child, so
+# marking it would let any Git command through. Everything else is marked,
+# because aliases (`jj push` for `jj git push`) hide the `git` subcommand.
+subcommand=""
+expect_value=false
+for arg in "$@"; do
+    if [[ "$expect_value" == true ]]; then
+        expect_value=false
+        continue
+    fi
+    case "$arg" in
+        -R | --repository | --at-operation | --at-op | --color | --config | --config-toml | --config-file)
+            expect_value=true
+            ;;
+        -*)
+            ;;
+        *)
+            subcommand="$arg"
+            break
+            ;;
+    esac
+done
+
+if [[ "$subcommand" == "util" ]]; then
+    unset AGENT_COMMAND_GUARDS_JJ_PID
+else
+    export AGENT_COMMAND_GUARDS_JJ_PID="$$"
+fi
+exec "$REAL_JJ" "$@"

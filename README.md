@@ -392,6 +392,26 @@ is merely similar. These target checks apply even with `-f`, including a symlink
 with a trailing directory separator. Changes, untracked files, and ignored
 files prevent removal unless `-f` is supplied.
 
+### jj
+
+`jj git fetch` and `jj git push` run `git fetch` and `git push` against the
+co-located repository, and those reach the `git` shadow, which refuses both. The
+`jj` shadow lets them through: it exports `AGENT_COMMAND_GUARDS_JJ_PID` set to its
+own process ID and then `exec`s the real jj, so that ID becomes jj's. The `git`
+shadow passes a command straight to Git, without snapshotting or refusing, only
+when that variable names its parent process. This covers aliases that expand to
+`jj git push`, since the shadow marks every jj command rather than parsing for
+`git`.
+
+A `git push` an agent runs itself has a different parent and is still refused.
+So is Git run through `jj util exec`: the `jj` shadow does not mark `util`
+commands and removes any marker it inherits. The marker is a way to recognize
+jj's own subprocesses, not a security boundary; a process that sets it by hand
+can get past the `git` shadow, as it could by calling `/usr/bin/git` directly.
+
+The marker exists only when jj is found on `PATH`. A jj invoked by absolute path
+gets no marker, and its pushes are refused.
+
 ### uv, just, and with-limits
 
 The `uv` shadow passes ordinary uv subcommands through unchanged. It runs `uv run`
@@ -451,7 +471,10 @@ Each wrapper has to locate the command it shadows without re-executing itself.
 `shadow_wrapper.py` and `git` scan `which -a <name>` and skip any candidate whose
 `realpath()` matches their own. `uv` walks `PATH` by hand instead, because it also
 has to skip mise shims: a shim ahead of the concrete `uv` binary hangs or recurses
-when this shadow comes earlier on `PATH`.
+when this shadow comes earlier on `PATH`. `jj` also walks `PATH` by hand, skipping
+any candidate that is the same file as itself (`-ef`), which sees through symlinks
+without starting another process; it runs before every jj command, including the
+ones jj's own tooling issues.
 
 Handoff uses `exec`, which preserves exit codes and signal behavior. `with-limits`
 is the deliberate exception, staying resident to monitor its child.

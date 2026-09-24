@@ -32,6 +32,18 @@ find_real_binary() {
 
 REAL_GIT="$(find_real_binary git "$SCRIPT_PATH")"
 
+# The jj shadow exports its own PID before exec'ing jj, so a Git whose parent is
+# that PID was spawned by jj itself: `jj git fetch` and `jj git push` shell out
+# to `git fetch` and `git push` with `--git-dir` naming a co-located repository.
+# Those run mid-operation, where snapshotting the working copy would record a
+# concurrent operation and any warning would be relayed to the user, so they
+# pass through untouched. Git started by anything else — an agent's own `git
+# push`, a hook, `jj util exec` — has a different parent and is still guarded.
+if [[ -n "${AGENT_COMMAND_GUARDS_JJ_PID:-}" && "$AGENT_COMMAND_GUARDS_JJ_PID" == "$PPID" ]]; then
+    unset AGENT_COMMAND_GUARDS_JJ_PID
+    exec "$REAL_GIT" "$@"
+fi
+
 GIT_SEARCH_DIR="$PWD"
 SUBCMD=""
 SUBCMD_INDEX=0

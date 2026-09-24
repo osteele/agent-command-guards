@@ -30,8 +30,11 @@ external entity ProbeResult {
 
 -- Git classification includes leading global options and the effective repository.
 -- read includes only allowlisted read forms; workspace_remove has its own rule.
+-- spawned_by_jj holds when the Git process's parent is a jj that the jj shadow
+-- marked with its own PID; jj util commands are never marked.
 external entity GitRequest {
     colocated_jj: Boolean
+    spawned_by_jj: Boolean
     operation: read | add | commit | amend | workspace_add | workspace_list |
         workspace_prune | workspace_remove | unclassified
     exact_registered_root: Boolean
@@ -204,6 +207,15 @@ rule ReportRefusedConnection {
 rule PassThroughGitOutsideColocatedJj {
     when: RunGit(request)
     requires: not request.colocated_jj
+    requires: not request.spawned_by_jj
+    ensures: ExecuteNativeGit(request)
+}
+
+-- Confirmed 2026-09-25: jj git fetch and jj git push run Git mid-operation, so
+-- the Git that jj itself spawns is neither synchronized nor classified.
+rule PassThroughJjSpawnedGit {
+    when: RunGit(request)
+    requires: request.spawned_by_jj
     ensures: ExecuteNativeGit(request)
 }
 
@@ -211,6 +223,7 @@ rule PassThroughGitOutsideColocatedJj {
 rule RejectUnclassifiedGit {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation = unclassified
     ensures: CommandRejected(request, "Use jj for this operation")
 }
@@ -218,6 +231,7 @@ rule RejectUnclassifiedGit {
 rule ExecuteAllowedGitRead {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation = read
     ensures: ExecuteSynchronizedGitRead(request)
 }
@@ -225,6 +239,7 @@ rule ExecuteAllowedGitRead {
 rule TreatGitAddAsTracked {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation = add
     ensures: CommandSucceededWithoutExecution(request)
 }
@@ -232,6 +247,7 @@ rule TreatGitAddAsTracked {
 rule TranslateGitMutation {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation in {commit, amend, workspace_add, workspace_list, workspace_prune}
     ensures: ExecuteJjTranslation(request)
 }
@@ -240,6 +256,7 @@ rule TranslateGitMutation {
 rule RejectProtectedWorkspaceRemoval {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation = workspace_remove
     requires: request.protected_target or (request.has_protected_data and not request.force)
     ensures: CommandRejected(request, "Workspace removal refused")
@@ -248,6 +265,7 @@ rule RejectProtectedWorkspaceRemoval {
 rule RemoveEligibleWorkspace {
     when: RunGit(request)
     requires: request.colocated_jj
+    requires: not request.spawned_by_jj
     requires: request.operation = workspace_remove
     requires: not request.protected_target
     requires: not request.has_protected_data or request.force

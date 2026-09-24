@@ -97,3 +97,15 @@ accepting D.*
   which is what agent-mail does for the live sessions it addresses — to keep the
   common case one command, accepting that a resume can land on a plausible wrong
   session when the user does not read the line that says so.
+
+- **2026-09-25** — In the context of `jj git push` and `jj git fetch` in a
+  co-located repository, facing a `git` shadow that fails closed on every
+  unclassified Git command — including the `git push` and `git fetch` that jj
+  itself spawns — we decided that a `jj` shadow exports its own PID and the
+  `git` shadow passes through a Git whose parent is that PID, and neglected the
+  transport allowlist that ADR 0001's Consequences anticipate, because an
+  allowlist would also let an agent's own `git push` through and would have to
+  be kept in step with the argv jj passes to Git; accepting a fourth real-binary
+  lookup, about 13 ms added to every jj command, and a fix that applies only
+  when jj is found on `PATH` — a jj invoked by absolute path gets no marker and
+  its pushes are still refused.

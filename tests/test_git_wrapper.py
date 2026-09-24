@@ -16,7 +16,14 @@ GIT_SHADOW = SHADOWS / "git"
 @unittest.skipIf(os.name == "nt", "the git shadow is a bash wrapper")
 class GitShadowIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        jj = shutil.which("jj")
+        # Skip the shadows directory: its jj wrapper would otherwise stand in for
+        # the real binary whose directory this test puts on PATH.
+        search_path = os.pathsep.join(
+            entry
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry and Path(entry).resolve() != SHADOWS.resolve()
+        )
+        jj = shutil.which("jj", path=search_path)
         if jj is None:
             self.skipTest("jj is required for Git shadow integration tests")
         self.jj = Path(jj)
