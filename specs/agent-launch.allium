@@ -358,6 +358,18 @@ surface AgentLauncher {
         -- Ordinary harness arguments retain their meaning. Launcher setup must
         -- not make unrelated repository files available as commands.
 
+    @guarantee HarnessHandoff
+        -- Confirmed: once setup finishes, the launcher replaces itself with the
+        -- real harness process; it never runs the harness as a child it waits on.
+        -- The harness therefore keeps the launcher's process ID, so identities
+        -- recorded against that ID (AGENT_SESSION_PID, host-PID name lookup)
+        -- name the harness. It is the terminal's foreground process, so tools
+        -- that identify an agent by that process see the harness, not a wrapper.
+        -- The shell observes the harness's own exit status and signals.
+        -- An intermediate program, such as a niceness adjustment, is permitted
+        -- only if it too replaces itself with the harness. Anything to be done
+        -- after the harness exits belongs to the shell prompt hook.
+
     @guarantee IdentitySeparation
         -- Baseline: a conversation can span multiple runs. Launcher bookkeeping,
         -- agent-mail identity, and native conversation identity are distinct.
